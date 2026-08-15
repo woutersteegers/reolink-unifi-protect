@@ -9,5 +9,5 @@ semver
 packaging
 uiprotect
 reolinkapi
-websockets>=9.0.1
+websockets>=9.0.1,<13
 xmltodict
