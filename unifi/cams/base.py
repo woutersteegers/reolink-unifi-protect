@@ -66,25 +66,37 @@ class UnifiCamBase(metaclass=ABCMeta):
             choices=["tcp", "udp", "http", "udp_multicast"],
             help="RTSP transport protocol used by stream",
         )
-        # --- House: Intel VAAPI hardware transcode (any source) ---
-        # UniFi Protect can't play a proxied H.265 live stream (snapshot works,
-        # live spins), so transcode H.265->H.264 on the Intel iGPU: decode and
-        # encode both stay on the GPU (hwaccel_output_format vaapi -> h264_vaapi).
+        # --- House: Intel QSV hardware transcode (any source) ---
+        # UniFi Protect cannot play a proxied H.265 live stream (the snapshot
+        # renders but live view spins forever), so the camera's HEVC main stream
+        # must reach Protect as H.264. Measured on this NAS (i5-1235U Iris Xe):
+        # HEVC decode 1.12x, but 3840-wide H.264 encode only 0.66x — the encode
+        # block is the limit, not the API (VAAPI and QSV performed the same).
+        # 2560x776 sustains 1.02x, so scale down as part of the transcode.
+        # QSV over VAAPI: VAAPI failed with "Cannot allocate memory" at every
+        # size here; QSV via vpp_qsv is stable. (scale_qsv does NOT work — it
+        # fails to configure its input pad; vpp_qsv is the working scaler.)
         parser.add_argument(
             "--hw-transcode",
             action="store_true",
-            help="Hardware-transcode video to H.264 via Intel VAAPI (iGPU)",
+            help="Hardware-transcode video to H.264 via Intel QSV (iGPU)",
         )
         parser.add_argument(
             "--hw-device",
             default="/dev/dri/renderD128",
-            help="VAAPI render node for --hw-transcode",
+            help="Intel render node for --hw-transcode",
         )
         parser.add_argument(
             "--transcode-width",
-            default=0,
+            default=2560,
             type=int,
-            help="If >0, scale transcoded video to this width (aspect kept)",
+            help="Output width for --hw-transcode (height from --transcode-height)",
+        )
+        parser.add_argument(
+            "--transcode-height",
+            default=776,
+            type=int,
+            help="Output height for --hw-transcode (vpp_qsv needs both explicitly)",
         )
         parser.add_argument(
             "--transcode-bitrate",
@@ -126,16 +138,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         raise NotImplementedError("You need to write this!")
 
     def get_extra_ffmpeg_args(self, stream_index: str = "") -> str:
-        # Post-input (encode) slot. When transcoding, encode H.264 on the GPU
-        # from the VAAPI surfaces produced by the hardware decoder below.
+        # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if getattr(self.args, "hw_transcode", False):
-            scale = (
-                f"scale_vaapi=w={self.args.transcode_width}:h=-2:format=nv12"
-                if self.args.transcode_width
-                else "scale_vaapi=format=nv12"
-            )
             return (
-                f'-vf "{scale}" -c:v h264_vaapi -b:v {self.args.transcode_bitrate}'
+                f'-vf "vpp_qsv=w={self.args.transcode_width}'
+                f':h={self.args.transcode_height}"'
+                f" -c:v h264_qsv -b:v {self.args.transcode_bitrate}"
                 " -ar 32000 -ac 1 -codec:a aac -b:a 32k"
             )
         return self.args.ffmpeg_args
@@ -488,7 +496,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 15,
                         "gopModel": 0,
-                        "height": 1552,
+                        "height": 776,
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -522,7 +530,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": 5120,
+                        "width": 2560,
                     },
                     "video2": {
                         "M": 1,
@@ -954,13 +962,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         except subprocess.CalledProcessError:
             self.logger.exception("Could not check for ffmpeg options")
 
-        # Pre-input (decode) slot: hardware-decode on the iGPU and keep frames
-        # as VAAPI surfaces so the h264_vaapi encoder needs no CPU round-trip.
+        # Pre-input (decode) slot: hardware-decode HEVC on the iGPU via QSV so
+        # frames stay on the GPU for vpp_qsv + h264_qsv (no CPU round-trip).
         prefix = ""
         if getattr(self.args, "hw_transcode", False):
             prefix = (
-                f"-hwaccel vaapi -hwaccel_device {self.args.hw_device}"
-                " -hwaccel_output_format vaapi "
+                f"-hwaccel qsv -qsv_device {self.args.hw_device} -c:v hevc_qsv "
             )
         return prefix + " ".join(base_args)
 
