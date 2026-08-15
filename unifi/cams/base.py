@@ -66,6 +66,31 @@ class UnifiCamBase(metaclass=ABCMeta):
             choices=["tcp", "udp", "http", "udp_multicast"],
             help="RTSP transport protocol used by stream",
         )
+        # --- House: Intel VAAPI hardware transcode (any source) ---
+        # UniFi Protect can't play a proxied H.265 live stream (snapshot works,
+        # live spins), so transcode H.265->H.264 on the Intel iGPU: decode and
+        # encode both stay on the GPU (hwaccel_output_format vaapi -> h264_vaapi).
+        parser.add_argument(
+            "--hw-transcode",
+            action="store_true",
+            help="Hardware-transcode video to H.264 via Intel VAAPI (iGPU)",
+        )
+        parser.add_argument(
+            "--hw-device",
+            default="/dev/dri/renderD128",
+            help="VAAPI render node for --hw-transcode",
+        )
+        parser.add_argument(
+            "--transcode-width",
+            default=0,
+            type=int,
+            help="If >0, scale transcoded video to this width (aspect kept)",
+        )
+        parser.add_argument(
+            "--transcode-bitrate",
+            default="6M",
+            help="Target bitrate for the hardware H.264 encode",
+        )
 
     async def _run(self, ws) -> None:
         self._session = ws
@@ -101,6 +126,18 @@ class UnifiCamBase(metaclass=ABCMeta):
         raise NotImplementedError("You need to write this!")
 
     def get_extra_ffmpeg_args(self, stream_index: str = "") -> str:
+        # Post-input (encode) slot. When transcoding, encode H.264 on the GPU
+        # from the VAAPI surfaces produced by the hardware decoder below.
+        if getattr(self.args, "hw_transcode", False):
+            scale = (
+                f"scale_vaapi=w={self.args.transcode_width}:h=-2:format=nv12"
+                if self.args.transcode_width
+                else "scale_vaapi=format=nv12"
+            )
+            return (
+                f'-vf "{scale}" -c:v h264_vaapi -b:v {self.args.transcode_bitrate}'
+                " -ar 32000 -ac 1 -codec:a aac -b:a 32k"
+            )
         return self.args.ffmpeg_args
 
     async def get_feature_flags(self) -> dict[str, Any]:
@@ -917,7 +954,15 @@ class UnifiCamBase(metaclass=ABCMeta):
         except subprocess.CalledProcessError:
             self.logger.exception("Could not check for ffmpeg options")
 
-        return " ".join(base_args)
+        # Pre-input (decode) slot: hardware-decode on the iGPU and keep frames
+        # as VAAPI surfaces so the h264_vaapi encoder needs no CPU round-trip.
+        prefix = ""
+        if getattr(self.args, "hw_transcode", False):
+            prefix = (
+                f"-hwaccel vaapi -hwaccel_device {self.args.hw_device}"
+                " -hwaccel_output_format vaapi "
+            )
+        return prefix + " ".join(base_args)
 
     async def start_video_stream(
         self, stream_index: str, stream_name: str, destination: tuple[str, int]
