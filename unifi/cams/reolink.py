@@ -54,6 +54,35 @@ class Reolink(UnifiCamBase):
             help="Stream profile to use for the lower quality stream",
         )
 
+        # --- House customization: Intel VAAPI hardware transcode ---
+        # The Reolink Elite Floodlight's main stream is H.265 (HEVC), which
+        # UniFi Protect will not accept from the proxy (it wants H.264). These
+        # flags let us hardware-transcode the high-quality stream H.265->H.264
+        # on the Intel iGPU (both decode and encode stay on the GPU), instead of
+        # the stock `-c:v copy` that only works for an already-H.264 source.
+        parser.add_argument(
+            "--hw-transcode",
+            action="store_true",
+            help="Hardware-transcode the high-quality stream to H.264 via Intel VAAPI",
+        )
+        parser.add_argument(
+            "--hw-device",
+            default="/dev/dri/renderD128",
+            help="VAAPI render node used for --hw-transcode",
+        )
+        parser.add_argument(
+            "--transcode-width",
+            default=0,
+            type=int,
+            help="If >0, scale the transcoded stream to this width (aspect kept); "
+            "helps Protect accept the camera's non-standard panoramic resolution",
+        )
+        parser.add_argument(
+            "--transcode-bitrate",
+            default="6M",
+            help="Target video bitrate for the hardware H.264 encode",
+        )
+
     def get_stream_info(self, camera) -> tuple[int, int]:
         info = camera.get_recording_encoding()
         return (
@@ -125,11 +154,44 @@ class Reolink(UnifiCamBase):
             except aiohttp.ClientError as err:
                 self.logger.error(f"Motion API request failed, retrying. Error: {err}")
 
+    def _transcoding(self, stream_index: str) -> bool:
+        # Only the high-quality stream (video1) is transcoded; the substream is
+        # already H.264 and is copied untouched.
+        return bool(getattr(self.args, "hw_transcode", False)) and stream_index == "video1"
+
+    def get_base_ffmpeg_args(self, stream_index: str = "") -> str:
+        base = super().get_base_ffmpeg_args(stream_index)
+        # Hardware-DECODE goes in the pre-input slot. -hwaccel_output_format
+        # vaapi keeps the decoded frames as GPU surfaces so the encoder below
+        # never round-trips them through system memory.
+        if self._transcoding(stream_index):
+            base = (
+                f"-hwaccel vaapi -hwaccel_device {self.args.hw_device}"
+                f" -hwaccel_output_format vaapi {base}"
+            )
+        return base
+
     def get_extra_ffmpeg_args(self, stream_index: str) -> str:
         if stream_index == "video1":
             fps = self.stream_fps[0]
         else:
             fps = self.stream_fps[1]
+
+        # Hardware-ENCODE (H.264) in the post-input slot. scale_vaapi runs on the
+        # GPU surfaces from decode; format=nv12 hands the encoder what it wants,
+        # and an optional width constrains the camera's odd panoramic size to
+        # something Protect will adopt.
+        if self._transcoding(stream_index):
+            scale = (
+                f"scale_vaapi=w={self.args.transcode_width}:h=-2:format=nv12"
+                if self.args.transcode_width
+                else "scale_vaapi=format=nv12"
+            )
+            return (
+                f'-vf "{scale}" -c:v h264_vaapi -b:v {self.args.transcode_bitrate}'
+                f' -bsf:v "h264_metadata=tick_rate={fps*2}"'
+                " -ar 32000 -ac 1 -codec:a aac -b:a 32k"
+            )
 
         return (
             "-ar 32000 -ac 1 -codec:a aac -b:a 32k -c:v copy -vbsf"

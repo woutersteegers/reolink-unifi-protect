@@ -1,0 +1,49 @@
+# House deployment: Reolink Elite Floodlight WiFi -> UniFi Protect, with the
+# H.265 main stream hardware-transcoded to H.264 on the Intel iGPU (VAAPI).
+#
+# Secrets (camera password, adoption token) come from an .env file that lives
+# ONLY on the NAS next to this compose (see .env.example) and is gitignored.
+# Build + run on the NAS (that is where /dev/dri and the camera network are):
+#   docker compose up -d --build
+services:
+  reolink-floodlight-proxy:
+    build:
+      context: ..
+      dockerfile: Dockerfile.vaapi
+    image: unifi-cam-proxy:vaapi
+    container_name: reolink-floodlight-proxy
+    restart: unless-stopped
+    devices:
+      - /dev/dri:/dev/dri          # Intel iGPU render node for VAAPI
+    group_add:
+      - video                       # permission to use the render node
+    volumes:
+      - ./client.pem:/client.pem:ro
+    command:
+      - unifi-cam-proxy
+      - --host
+      - "${NVR_IP}"
+      - --cert
+      - /client.pem
+      - --token
+      - "${ADOPTION_TOKEN}"
+      - --mac
+      - "${CAM_MAC}"
+      - --ip
+      - "${CAM_IP}"
+      - --name
+      - "${CAM_NAME}"
+      - reolink
+      - --username
+      - "${CAM_USER}"
+      - --password
+      - "${CAM_PASS}"
+      - --stream
+      - main
+      - --hw-transcode
+      - --hw-device
+      - /dev/dri/renderD128
+      - --transcode-width
+      - "${TRANSCODE_WIDTH}"
+      - --transcode-bitrate
+      - "${TRANSCODE_BITRATE}"
