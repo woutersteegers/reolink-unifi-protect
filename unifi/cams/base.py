@@ -975,9 +975,11 @@ class UnifiCamBase(metaclass=ABCMeta):
         # frames stay on the GPU for vpp_qsv + h264_qsv (no CPU round-trip).
         prefix = ""
         if self._hw_transcoding(stream_index):
-            prefix = (
-                f"-hwaccel qsv -qsv_device {self.args.hw_device} -c:v hevc_qsv "
-            )
+            # NOTE: do NOT pin `-c:v hevc_qsv` here. The hi source is HEVC, but
+            # if this stream ever carries H.264 (e.g. a sub-stream fallback),
+            # forcing the HEVC decoder fails with "Function not implemented".
+            # `-hwaccel qsv` alone lets ffmpeg pick the right QSV decoder.
+            prefix = f"-hwaccel qsv -qsv_device {self.args.hw_device} "
         return prefix + " ".join(base_args)
 
     async def start_video_stream(
