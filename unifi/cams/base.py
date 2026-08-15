@@ -137,9 +137,18 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def get_stream_source(self, stream_index: str) -> str:
         raise NotImplementedError("You need to write this!")
 
+    def _hw_transcoding(self, stream_index: str = "") -> bool:
+        # Only the HIGH-quality stream is transcoded. Protect opens several
+        # channels at once, and this iGPU fits exactly ONE 2560-wide transcode
+        # (1.02x); transcoding two starves the encoder and both respawn-loop.
+        # The other channels are served from an already-H.264 source instead.
+        if not getattr(self.args, "hw_transcode", False):
+            return False
+        return stream_index in ("", "video1")
+
     def get_extra_ffmpeg_args(self, stream_index: str = "") -> str:
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
-        if getattr(self.args, "hw_transcode", False):
+        if self._hw_transcoding(stream_index):
             return (
                 f'-vf "vpp_qsv=w={self.args.transcode_width}'
                 f':h={self.args.transcode_height}"'
@@ -965,7 +974,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         # Pre-input (decode) slot: hardware-decode HEVC on the iGPU via QSV so
         # frames stay on the GPU for vpp_qsv + h264_qsv (no CPU round-trip).
         prefix = ""
-        if getattr(self.args, "hw_transcode", False):
+        if self._hw_transcoding(stream_index):
             prefix = (
                 f"-hwaccel qsv -qsv_device {self.args.hw_device} -c:v hevc_qsv "
             )
