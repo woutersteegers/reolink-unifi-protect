@@ -5,7 +5,9 @@ import sys
 from shutil import which
 
 import coloredlogs
-from pyunifiprotect import ProtectApiClient
+# House: pyunifiprotect was renamed to uiprotect and dropped from PyPI for
+# Python 3.12+; uiprotect is the maintained drop-in (same ProtectApiClient).
+from uiprotect import ProtectApiClient
 
 from unifi.cams import (
     DahuaCam,
