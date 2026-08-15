@@ -22,6 +22,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         libjpeg-dev zlib1g-dev \
         ffmpeg netcat-openbsd \
         intel-media-va-driver-non-free libva2 libva-drm2 vainfo \
+        libvpl2 libmfxgen1 \
     && rm -rf /var/lib/apt/lists/*
 
 # Isolated venv avoids Ubuntu's PEP 668 "externally-managed" pip restriction.
