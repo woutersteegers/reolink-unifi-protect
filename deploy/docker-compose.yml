@@ -1,9 +1,18 @@
-# House deployment: Reolink Elite Floodlight WiFi -> UniFi Protect, with the
-# H.265 main stream hardware-transcoded to H.264 on the Intel iGPU (VAAPI).
+# House deployment: Reolink Elite Floodlight WiFi -> UniFi Protect,
+# pure passthrough (NO transcoding):
+#   video1 = camera's native H.265 main stream (5120x1552), declared honestly
+#            via --hi-codec h265 (needs Protect's H.265/"enhanced" support)
+#   video2/video3 = camera's native H.264 sub stream (1920x576@30)
 #
 # Secrets (camera password, adoption token) come from an .env file that lives
-# ONLY on the NAS next to this compose (see .env.example) and is gitignored.
-# Build + run on the NAS (that is where /dev/dri and the camera network are):
+# ONLY on the NAS next to this compose and is gitignored. Required vars:
+#   NVR_IP, ADOPTION_TOKEN, CAM_MAC, CAM_IP, CAM_NAME, CAM_USER, CAM_PASS
+#
+# Protect caches capabilities (model/codec/resolution) at ADOPTION. Changing
+# any of them means: remove camera in Protect UI -> fresh token into .env
+# (tokens live ~60 min) -> docker compose up -d --force-recreate.
+#
+# Build + run on the NAS (that is where the camera network is):
 #   docker compose up -d --build
 services:
   reolink-floodlight-proxy:
@@ -13,10 +22,12 @@ services:
     image: unifi-cam-proxy:vaapi
     container_name: reolink-floodlight-proxy
     restart: unless-stopped
-    devices:
-      - /dev/dri:/dev/dri          # Intel iGPU render node for VAAPI
-    group_add:
-      - video                       # permission to use the render node
+    # Only needed for the --hw-transcode FALLBACK (see HANDOFF.md); the
+    # passthrough plan never touches the iGPU:
+    # devices:
+    #   - /dev/dri:/dev/dri
+    # group_add:
+    #   - video
     volumes:
       - ./client.pem:/client.pem:ro
     command:
@@ -33,17 +44,30 @@ services:
       - "${CAM_IP}"
       - --name
       - "${CAM_NAME}"
-      - reolink
-      - --username
-      - "${CAM_USER}"
-      - --password
-      - "${CAM_PASS}"
-      - --stream
-      - main
-      - --hw-transcode
-      - --hw-device
-      - /dev/dri/renderD128
-      - --transcode-width
-      - "${TRANSCODE_WIDTH}"
-      - --transcode-bitrate
-      - "${TRANSCODE_BITRATE}"
+      # H.265-capable model. The default (UVC G3) is an H.264-only camera and
+      # Protect gates codec capabilities by model, which would likely doom the
+      # honest h265 declaration on video1.
+      - --model
+      - "UVC G5 Pro"
+      - rtsp
+      - -s
+      - "rtsp://${CAM_USER}:${CAM_PASS}@${CAM_IP}:554/h264Preview_01_main"
+      - "rtsp://${CAM_USER}:${CAM_PASS}@${CAM_IP}:554/h264Preview_01_sub"
+      # Snapshots via the camera's HTTPS API instead of a fourth always-on
+      # RTSP session (Reolink WiFi cams limit concurrent RTSP connections).
+      - --snapshot-url
+      - "https://${CAM_IP}/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=proxy&user=${CAM_USER}&password=${CAM_PASS}"
+      - --hi-codec
+      - h265
+      - --hi-width
+      - "5120"
+      - --hi-height
+      - "1552"
+      - --hi-fps
+      - "20"
+      - --lo-width
+      - "1920"
+      - --lo-height
+      - "576"
+      - --lo-fps
+      - "30"

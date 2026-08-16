@@ -3,10 +3,11 @@
 # Hardware: UGREEN NAS, Intel Core i5-1235U (Iris Xe iGPU), Unraid 7.2.3,
 # /dev/dri/renderD128 exposed. Upstream's published image is Alpine 3.10 with
 # an ffmpeg that has VAAPI encoders compiled in but NO Intel driver, so VAAPI
-# cannot initialize there. This image builds on Ubuntu 24.04 (glibc) with the
-# Intel iHD media driver, so the Reolink Elite Floodlight's H.265 main stream
-# can be hardware-transcoded to H.264 (decode + encode both on the iGPU) for
-# UniFi Protect, using the --hw-transcode flags added to unifi/cams/reolink.py.
+# cannot initialize there. This image builds on Ubuntu 24.04 (glibc): its
+# ffmpeg 6.1 can mux HEVC into FLV ("enhanced FLV"), which the current
+# H.265-passthrough plan needs, and the Intel iHD driver + oneVPL runtime
+# keep the QSV fallback (--hw-transcode in unifi/cams/base.py) working if
+# Protect refuses the passthrough stream.
 #
 # Build (on the NAS, where the iGPU is):
 #   docker build -f Dockerfile.vaapi -t unifi-cam-proxy:vaapi .
