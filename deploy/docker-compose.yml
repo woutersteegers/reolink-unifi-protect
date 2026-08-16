@@ -90,7 +90,7 @@ services:
       # detections clear a higher bar. Drop 'animal' from --ai-classes
       # instead to disable the class entirely.
       - --ai-confidence-overrides
-      - "animal=0.9"
+      - "animal=0.95"
       # Audio passthrough (AAC-LC 16k mono, the real UniFi wire format).
       # Timestamps come from the camera's RTP clock (wallclock stamping
       # removed in base.py) so the samples line up gaplessly.

@@ -32,6 +32,7 @@ class RTSPCam(UnifiCamBase):
         self._sink_last_ts = 0.0
         self._sink_last_boxes_ts = 0.0
         self._ai_tracks: list = []
+        self._ai_active_lead = None
         self.stream_source = dict()
         for i, stream_index in enumerate(["video1", "video2", "video3"]):
             if not i < len(self.args.source):
@@ -271,19 +272,34 @@ class RTSPCam(UnifiCamBase):
             )
         if descriptors:
             self._sink_last_boxes_ts = time.time()
+            present = {d["objectType"] for d in descriptors}
+            lead = next(t for t in priority if t in present)
+            detail = ", ".join(
+                f"{d['objectType']}@{d['confidenceLevel']}%" for d in descriptors
+            )
             if not self._motion_event_ts:
-                present = {d["objectType"] for d in descriptors}
-                lead = next(t for t in priority if t in present)
-                detail = ", ".join(
-                    f"{d['objectType']}@{d['confidenceLevel']}%"
-                    for d in descriptors
-                )
-                self.logger.info(
-                    f"AI boxes: {detail} — starting smart event"
-                )
+                self.logger.info(f"AI boxes: {detail} — starting smart event")
                 await self.trigger_motion_start(
                     SmartDetectObjectType(lead), descriptors=descriptors
                 )
+                self._ai_active_lead = lead
+            elif (
+                self._ai_active_lead
+                and lead in priority
+                and priority.index(lead) < priority.index(self._ai_active_lead)
+            ):
+                # A higher-priority class appeared (e.g. the camera first
+                # misread a person as an animal, then recognized them):
+                # retype by restarting the event under the better class.
+                self.logger.info(
+                    f"AI class upgrade {self._ai_active_lead} -> {lead}"
+                    f" ({detail}) — retyping event"
+                )
+                await self.trigger_motion_stop()
+                await self.trigger_motion_start(
+                    SmartDetectObjectType(lead), descriptors=descriptors
+                )
+                self._ai_active_lead = lead
             else:
                 await self.trigger_motion_update(descriptors)
         elif (
@@ -293,6 +309,7 @@ class RTSPCam(UnifiCamBase):
         ):
             self.logger.info("AI boxes clear — ending smart event")
             await self.trigger_motion_stop()
+            self._ai_active_lead = None
 
     async def _poll_reolink_ai(self) -> None:
         url = (
