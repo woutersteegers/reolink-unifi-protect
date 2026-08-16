@@ -218,7 +218,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             # into hevc_qsv on the iGPU.
             return (
                 f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
-                " -c:a copy"
+                " -af aresample=async=1 -c:a aac -ar 16000 -ac 1 -b:a 32k"
             )
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if self._hw_transcoding(stream_index):
