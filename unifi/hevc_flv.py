@@ -89,44 +89,80 @@ def _hvcc_parameter_sets(record: bytes):
     return None
 
 
-def transform_video(body: bytes):
+def _build_config(sets) -> bytes:
+    # Real-camera config shape: byte0=0x68, byte1=1, then bare 2-byte
+    # length-prefixed VPS/SPS/PPS, no composition field (pyunifiwire
+    # hevc.parameter_sets, measured on a real UVC). An hvcC record here
+    # makes Protect sniff the codec as VUNK.
+    out = bytearray([(FRAME_SEQUENCE_HEADER << 4) | CODEC_H265, 1])
+    for unit in sets:
+        out += len(unit).to_bytes(2, "big") + unit
+    return bytes(out)
+
+
+def _inband_parameter_sets(payload: bytes):
+    """Harvest (VPS, SPS, PPS) from 4-byte length-prefixed NAL units.
+
+    After an encoder reconfigure the RTSP SDP can lack the parameter
+    sets, leaving ffmpeg's hvcC empty — but HEVC keyframes carry them
+    in band, so the config can be rebuilt from the first keyframe.
+    """
+    found = {}
+    cur = 0
+    while cur + 4 <= len(payload):
+        size = int.from_bytes(payload[cur: cur + 4], "big")
+        cur += 4
+        if size <= 0 or cur + size > len(payload):
+            break
+        unit = payload[cur: cur + size]
+        cur += size
+        kind = (unit[0] >> 1) & 0x3F
+        if kind in (32, 33, 34) and kind not in found:
+            found[kind] = unit
+    if all(k in found for k in (32, 33, 34)):
+        return found[32], found[33], found[34]
+    return None
+
+
+def transform_video(body: bytes, state: dict):
     """Rewrite an Enhanced-RTMP hvc1 tag body to UniFi framing.
 
-    Returns the new body, or None when the tag has no UniFi equivalent
-    (e.g. PacketTypeMetadata colour info) and must be dropped.
+    Returns a LIST of bodies to emit in place of the tag (empty list =
+    drop). A config tag can be injected ahead of a frame when the
+    parameter sets had to be harvested in band.
     """
     if not body or not (body[0] & 0x80):
-        return body  # legacy tag (e.g. h264) — not ours to touch
+        return [body]  # legacy tag (e.g. h264) — not ours to touch
     frame_type = (body[0] >> 4) & 0x07
     packet_type = body[0] & 0x0F
     if body[1:5] != b"hvc1":
-        return body
+        return [body]
     rest = body[5:]
     if packet_type == EX_SEQUENCE_START:
-        # Payload is an hvcC record. Protect's codec sniffer does NOT
-        # read hvcC (it reports codec VUNK): a real camera's config tag
-        # is byte0=0x68, byte1=1, then bare 2-byte length-prefixed
-        # VPS/SPS/PPS with no composition field (pyunifiwire
-        # hevc.parameter_sets, measured on a real UVC).
         sets = _hvcc_parameter_sets(rest)
         if sets is None:
-            return bytes([(FRAME_SEQUENCE_HEADER << 4) | CODEC_H265,
-                          PACKET_SEQUENCE_HEADER, 0, 0, 0]) + rest
-        out = bytearray([(FRAME_SEQUENCE_HEADER << 4) | CODEC_H265, 1])
-        for unit in sets:
-            out += len(unit).to_bytes(2, "big") + unit
-        return bytes(out)
+            # Empty/incomplete hvcC — drop it and rebuild the config
+            # from the first keyframe's in-band NALs instead.
+            return []
+        state["config_done"] = True
+        return [_build_config(sets)]
     ft = FRAME_KEY if frame_type == 1 else FRAME_INTER
     if packet_type == EX_CODED_FRAMES:
-        # 3-byte composition time, then 4-byte length-prefixed NALs.
-        return bytes([(ft << 4) | CODEC_H265, PACKET_NALU]) + rest[:3] + rest[3:]
-    if packet_type == EX_CODED_FRAMES_X:
-        # No composition-time field; it is implicitly zero.
-        return bytes([(ft << 4) | CODEC_H265, PACKET_NALU, 0, 0, 0]) + rest
-    if packet_type == EX_SEQUENCE_END:
-        return bytes([(FRAME_KEY << 4) | CODEC_H265, PACKET_END, 0, 0, 0])
-    # Metadata (4), MPEG2-TS (5), multitrack (6), ...: no UniFi equivalent.
-    return None
+        ct, payload = rest[:3], rest[3:]
+    elif packet_type == EX_CODED_FRAMES_X:
+        ct, payload = b"\x00\x00\x00", rest
+    elif packet_type == EX_SEQUENCE_END:
+        return [bytes([(FRAME_KEY << 4) | CODEC_H265, PACKET_END, 0, 0, 0])]
+    else:
+        # Metadata (4), MPEG2-TS (5), multitrack (6): no UniFi equivalent.
+        return []
+    frame = bytes([(ft << 4) | CODEC_H265, PACKET_NALU]) + ct + payload
+    if not state.get("config_done"):
+        sets = _inband_parameter_sets(payload)
+        if sets is not None:
+            state["config_done"] = True
+            return [_build_config(sets), frame]
+    return [frame]
 
 
 def _amf_string(value: str) -> bytes:
@@ -190,6 +226,7 @@ def replace_metadata(body: bytes) -> bytes:
 def main() -> None:
     source = sys.stdin.buffer
     sink = sys.stdout.buffer
+    state: dict = {"config_done": False}
 
     # FLV header (9 bytes) + first previous-tag-size (4): pass through.
     head = read_exact(source, 9 + PREV_SIZE_LEN)
@@ -212,17 +249,20 @@ def main() -> None:
 
         kind = header[0]
         if kind == TAG_VIDEO:
-            body = transform_video(body)
-            if body is None:
-                continue  # tag has no UniFi equivalent — drop it
+            bodies = transform_video(body, state)
         elif kind == TAG_SCRIPT:
-            body = replace_metadata(body)
+            bodies = [replace_metadata(body)]
+        else:
+            bodies = [body]
 
-        out = bytearray(header)
-        out[1:4] = len(body).to_bytes(3, "big")
-        sink.write(bytes(out))
-        sink.write(body)
-        sink.write((TAG_HEADER_LEN + len(body)).to_bytes(PREV_SIZE_LEN, "big"))
+        for out_body in bodies:
+            out = bytearray(header)
+            out[1:4] = len(out_body).to_bytes(3, "big")
+            sink.write(bytes(out))
+            sink.write(out_body)
+            sink.write(
+                (TAG_HEADER_LEN + len(out_body)).to_bytes(PREV_SIZE_LEN, "big")
+            )
         sink.flush()
 
 

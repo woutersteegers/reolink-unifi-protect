@@ -84,22 +84,6 @@ services:
       # GetAiState poller above stands down while reports are fresh.
       - --ai-sink-port
       - "7999"
-
-  # Decodes the camera's own AI detection rectangles (person/vehicle/
-  # animal, the same boxes the Reolink app draws) off the Baichuan
-  # protocol via nodelink-js, and streams them to the proxy so Protect
-  # shows moving, accurately-placed detection boxes.
-  reolink-ai-sidecar:
-    build: ./ai-sidecar
-    container_name: reolink-ai-sidecar
-    restart: unless-stopped
-    depends_on:
-      - reolink-floodlight-proxy
-    environment:
-      - CAM_IP=${CAM_IP}
-      - CAM_USER=${CAM_USER}
-      - CAM_PASS=${CAM_PASS}
-      - SINK_URL=http://reolink-floodlight-proxy:7999/detections
       # Audio passthrough (AAC-LC 16k mono, the real UniFi wire format).
       # Timestamps come from the camera's RTP clock (wallclock stamping
       # removed in base.py) so the samples line up gaplessly.
@@ -122,3 +106,19 @@ services:
       - "576"
       - --lo-fps
       - "30"
+
+  # Decodes the camera's own AI detection rectangles (person/vehicle/
+  # animal, the same boxes the Reolink app draws) off the Baichuan
+  # protocol via nodelink-js, and streams them to the proxy so Protect
+  # shows moving, accurately-placed detection boxes.
+  reolink-ai-sidecar:
+    build: ./ai-sidecar
+    container_name: reolink-ai-sidecar
+    restart: unless-stopped
+    depends_on:
+      - reolink-floodlight-proxy
+    environment:
+      - CAM_IP=${CAM_IP}
+      - CAM_USER=${CAM_USER}
+      - CAM_PASS=${CAM_PASS}
+      - SINK_URL=http://reolink-floodlight-proxy:7999/detections
