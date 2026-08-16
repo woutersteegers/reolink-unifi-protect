@@ -72,12 +72,19 @@ services:
       # RTSP session (Reolink WiFi cams limit concurrent RTSP connections).
       - --snapshot-url
       - "https://${CAM_IP}/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=proxy&user=${CAM_USER}&password=${CAM_PASS}"
-      # Audio: re-encode AAC 16k mono with async resample. Straight
-      # -c:a copy crackles: wallclock-stamped RTSP packets jitter, so
-      # passed-through AAC plays with micro-gaps; aresample=async=1
-      # re-spaces the samples onto a smooth timeline.
+      # Bridge the camera's on-board AI (person/vehicle/animal) into
+      # Protect smart detections — no AI Port involved.
+      - --reolink-ai-host
+      - "${CAM_IP}"
+      - --reolink-ai-user
+      - "${CAM_USER}"
+      - --reolink-ai-password
+      - "${CAM_PASS}"
+      # Audio passthrough (AAC-LC 16k mono, the real UniFi wire format).
+      # Timestamps come from the camera's RTP clock (wallclock stamping
+      # removed in base.py) so the samples line up gaplessly.
       - --ffmpeg-args
-      - "-c:v copy -af aresample=async=1 -c:a aac -ar 16000 -ac 1 -b:a 32k"
+      - "-c:v copy -c:a copy"
       - --hi-codec
       - h265
       - --hi-width

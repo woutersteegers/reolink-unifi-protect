@@ -27,6 +27,7 @@ AVClientRequest = AVClientResponse = dict[str, Any]
 class SmartDetectObjectType(Enum):
     PERSON = "person"
     VEHICLE = "vehicle"
+    ANIMAL = "animal"
 
 
 class UnifiCamBase(metaclass=ABCMeta):
@@ -218,7 +219,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             # into hevc_qsv on the iGPU.
             return (
                 f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
-                " -af aresample=async=1 -c:a aac -ar 16000 -ac 1 -b:a 32k"
+                " -c:a copy"
             )
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if self._hw_transcoding(stream_index):
@@ -251,7 +252,9 @@ class UnifiCamBase(metaclass=ABCMeta):
             "aec": [],
             "videoMode": ["default"],
             "motionDetect": ["enhanced"],
-            "smartDetect": [],
+            # Classes the Reolink's own on-camera AI can emit; also what
+            # Protect needs to see for AI Port pairing to make sense.
+            "smartDetect": ["person", "vehicle", "animal"],
             "videoCodecs": codecs,
             "audioCodecs": ["aac"],
             "audioStyle": ["nature"],
@@ -263,6 +266,13 @@ class UnifiCamBase(metaclass=ABCMeta):
             "hasMotionZones": True,
             "hasPrivacyMask": False,
             "isPtz": False,
+            # Protect derives aiPortCompatibleResolutions /
+            # supportAiPortResolution from the camera's advertised
+            # scaling tiers; without these it computes [] and the AI Port
+            # pairing UI never offers the camera. Values mirror a real 4K
+            # camera's ladder.
+            "maxScaleDownLevel": 2,
+            "downScaleResolutions": [[3840, 2160], [2688, 1512], [1920, 1080]],
         }
 
     # API for subclasses
@@ -1078,12 +1088,16 @@ class UnifiCamBase(metaclass=ABCMeta):
         return False
 
     def get_base_ffmpeg_args(self, stream_index: str = "") -> str:
+        # No -use_wallclock_as_timestamps: stamping packets with network
+        # ARRIVAL time makes audio PTS bursty (TCP-interleaved RTSP
+        # delivers in bursts) — audible as crackle/dropouts. The camera's
+        # RTP clock gives exactly-spaced timestamps; clock_sync's periodic
+        # onClockSync ties them to wall time for Protect.
         base_args = [
             "-avoid_negative_ts",
             "make_zero",
             "-fflags",
             "+genpts+discardcorrupt",
-            "-use_wallclock_as_timestamps 1",
         ]
 
         try:
