@@ -104,6 +104,17 @@ class RTSPCam(UnifiCamBase):
             help="Suppress boxes until they move this far (0-1000 units;"
             " kills stationary false positives like buildings; 0 disables)",
         )
+        parser.add_argument(
+            "--ai-classes",
+            default="person,vehicle,animal",
+            help="Detection classes to forward, in priority order",
+        )
+        parser.add_argument(
+            "--ai-confidence-overrides",
+            default="",
+            help="Per-class minimum confidence, e.g. 'animal=0.9' — for"
+            " classes the camera misfires on (a person read as dog_cat)",
+        )
 
     def start_snapshot_stream(self) -> None:
         if not self.snapshot_stream or self.snapshot_stream.poll() is not None:
@@ -228,10 +239,24 @@ class RTSPCam(UnifiCamBase):
                 out.append(box)
         return out
 
+    def _min_confidence(self, kind: str) -> float:
+        overrides = getattr(self, "_conf_overrides", None)
+        if overrides is None:
+            overrides = {}
+            for part in (self.args.ai_confidence_overrides or "").split(","):
+                if "=" in part:
+                    key, _, value = part.partition("=")
+                    try:
+                        overrides[key.strip()] = float(value)
+                    except ValueError:
+                        pass
+            self._conf_overrides = overrides
+        return overrides.get(kind, self.args.ai_min_confidence)
+
     async def _on_ai_boxes(self, boxes: list) -> None:
         self._sink_last_ts = time.time()
         boxes = self._filter_stationary(boxes)
-        priority = ["person", "vehicle", "animal"]
+        priority = [c.strip() for c in self.args.ai_classes.split(",") if c.strip()]
         descriptors = []
         for i, box in enumerate(boxes):
             kind = box.get("type")
@@ -239,7 +264,7 @@ class RTSPCam(UnifiCamBase):
             if kind not in priority or not coord or len(coord) != 4:
                 continue
             confidence = float(box.get("confidence") or 0.8)
-            if confidence < self.args.ai_min_confidence:
+            if confidence < self._min_confidence(kind):
                 continue
             descriptors.append(
                 self.build_smart_descriptor(kind, coord, confidence, i)
@@ -249,8 +274,12 @@ class RTSPCam(UnifiCamBase):
             if not self._motion_event_ts:
                 present = {d["objectType"] for d in descriptors}
                 lead = next(t for t in priority if t in present)
+                detail = ", ".join(
+                    f"{d['objectType']}@{d['confidenceLevel']}%"
+                    for d in descriptors
+                )
                 self.logger.info(
-                    f"AI boxes: {sorted(present)} — starting smart event"
+                    f"AI boxes: {detail} — starting smart event"
                 )
                 await self.trigger_motion_start(
                     SmartDetectObjectType(lead), descriptors=descriptors
