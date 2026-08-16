@@ -1,10 +1,39 @@
 # HANDOFF — Reolink Elite Floodlight → UniFi Protect via this fork
 
 **For the next Claude session, working in this repo.** Everything below was
-established empirically on 2026-08-15 (see `git log` — every finding is also
-in commit messages/comments). The human is Wouter; his infra details follow.
+established empirically on 2026-08-15/16 (see `git log` — every finding is
+also in commit messages/comments). The human is Wouter; his infra follows.
 
-## Goal (current plan, chosen by Wouter)
+## STATUS: WORKING (2026-08-16)
+
+The h265 plan SUCCEEDED — believed to be the first working H.265
+passthrough into Protect over the ubnt_avclient path. End state:
+- **video1**: camera's native 5120×1552 HEVC, `-c:v copy`, rewritten to
+  UniFi framing by `unifi.hevc_flv` → **live view plays, HQ records**.
+- **video2/3**: camera's H.264 sub QSV-transcoded to HEVC on the iGPU
+  (`--lo-h265-transcode`, ~4.4× realtime per stream) → LQ records.
+  (Protect expects EVERY channel in HEVC once enhanced encoding is on.)
+- Camera registers as **UVC G5 Pro** (sysid 0xa598 identity), claims fw
+  5.4.122 so Protect doesn't push upgrades. Enhanced-encoding toggle ON
+  (camera-level videoCodec=h265, done once by Wouter in the UI).
+- The full pipeline: `ffmpeg | unifi.hevc_flv | unifi.clock_sync | nc`.
+- deploy/docker-compose.yml IS the current config; .env on NAS has
+  token/password.
+
+What made it work (each was a real blocker, in order): featureFlags
+videoCodecs advertisement → enhanced toggle → UniFi codec-8 framing →
+camera-vocabulary AMF0-object onMetaData (extendedFormat:true) →
+clock_sync trailer ticks in the trailer's own clock (90000/11025) →
+NAS clock 60s fast (ntpdate'd; ENABLE NTPD ON UNRAID) → config tag as
+byte1=1 + bare 2-byte-prefixed VPS/SPS/PPS (hvcC ⇒ codec VUNK).
+
+Debugging access: UDM Pro SSH (root, ask Wouter; he enabled it
+2026-08-16). Protect logs: `/srv/unifi-protect/logs/` (node side),
+`/srv/ms/logs/ms.err.00.log` + `msr.00.log`/`msr.err.00.log` (media
+ingest/recorder — the ones that matter). Camera streams are named
+`<MAC>_<channelId>` (0=High,1=Medium,2=Low).
+
+## Original goal (historical)
 
 Feed the camera into UniFi Protect with **NO transcoding at all**:
 - **Hi stream (video1): the camera's native H.265 main stream, passed through**

@@ -72,6 +72,10 @@ services:
       # RTSP session (Reolink WiFi cams limit concurrent RTSP connections).
       - --snapshot-url
       - "https://${CAM_IP}/cgi-bin/api.cgi?cmd=Snap&channel=0&rs=proxy&user=${CAM_USER}&password=${CAM_PASS}"
+      # Pass the camera's AAC-LC 16k mono through untouched — the exact
+      # audio format the real UniFi HEVC wire carries.
+      - --ffmpeg-args
+      - "-c:v copy -c:a copy"
       - --hi-codec
       - h265
       - --hi-width

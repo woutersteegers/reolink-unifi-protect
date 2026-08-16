@@ -218,7 +218,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             # into hevc_qsv on the iGPU.
             return (
                 f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
-                " -ar 32000 -ac 1 -codec:a aac -b:a 32k"
+                " -c:a copy"
             )
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if self._hw_transcoding(stream_index):
@@ -554,9 +554,11 @@ class UnifiCamBase(metaclass=ABCMeta):
                     "enabled": True,
                     "mode": 0,
                     "quality": 0,
-                    # Match what ffmpeg actually sends (-ar 32000); volume 0
-                    # made Protect store micVolume=0 / mic disabled.
-                    "sampleRate": 32000,
+                    # The camera's native AAC is 16 kHz mono and is passed
+                    # through (-c:a copy) — the same rate the real UniFi
+                    # HEVC wire carries. volume 0 made Protect store
+                    # micVolume=0 / mic disabled.
+                    "sampleRate": 16000,
                     "type": "aac",
                     "volume": 100,
                 },
