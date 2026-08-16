@@ -104,6 +104,26 @@ def parse_args():
         default="UVC.S2L.v4.23.8.67.0eba6e3.200526.1046",
         help="Firmware version to initiate connection with",
     )
+    # House: Protect >=3.0 stopped copying `model` from the hello into the
+    # camera record; model recognition keys on the numeric sysid (+ platform,
+    # firmwareBuild, and the hex `camera-model` WSS header). When --sysid is
+    # set, the full identity is sent and --fw-version should be the SHORT
+    # form (e.g. "5.3.95").
+    parser.add_argument(
+        "--sysid",
+        default=None,
+        help="Hex system id of the emulated model (e.g. 0xa598 = UVC G5 Pro)",
+    )
+    parser.add_argument(
+        "--platform",
+        default=None,
+        help="Camera platform code matching --sysid (e.g. sav837gw)",
+    )
+    parser.add_argument(
+        "--fw-build",
+        default=None,
+        help="firmwareBuild string (e.g. 148b9a3.260612.645)",
+    )
     parser.add_argument(
         "--verbose", "-v", action="store_true", help="increase output verbosity"
     )

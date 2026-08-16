@@ -1,5 +1,6 @@
 import asyncio
 import ssl
+import uuid
 
 import backoff
 import websockets
@@ -14,6 +15,7 @@ class Core(object):
         self.host = args.host
         self.token = args.token
         self.mac = args.mac
+        self.args = args
         self.logger = logger
         self.cam = camera
 
@@ -26,6 +28,23 @@ class Core(object):
     async def run(self) -> None:
         uri = "wss://{}:7442/camera/1.0/ws?token={}".format(self.host, self.token)
         headers = {"camera-mac": self.mac}
+        if getattr(self.args, "sysid", None):
+            # Real cameras also identify on the WSS handshake. camera-model
+            # must be the HEX SYSID (e.g. 0xa598) — sending the model NAME
+            # here gets a 400 from Protect's internal proxy.
+            headers.update(
+                {
+                    "camera-model": f"0x{int(self.args.sysid, 0):04x}",
+                    "camera-ip": self.args.ip,
+                    "camera-firmware": self.args.fw_version,
+                    "device-id": str(
+                        uuid.uuid5(
+                            uuid.NAMESPACE_DNS, f"unifi-cam-proxy-{self.mac}"
+                        )
+                    ),
+                    "x-guid": str(uuid.uuid4()),
+                }
+            )
         has_connected = False
 
         @backoff.on_predicate(
@@ -38,7 +57,10 @@ class Core(object):
         )
         async def connect():
             nonlocal has_connected
-            self.logger.info(f"Creating ws connection to {uri}")
+            self.logger.info(
+                "Creating ws connection to"
+                f" wss://{self.host}:7442/camera/1.0/ws?token={self.token[:4]}…"
+            )
             try:
                 ws = await websockets.connect(
                     uri,

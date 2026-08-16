@@ -202,18 +202,28 @@ class UnifiCamBase(metaclass=ABCMeta):
         # motionDetect->motionAlgorithms), so the camera-side key for the
         # codec list is uncertain — send singular and plural forms; unknown
         # keys are ignored.
+        # Vocabulary matched to a real G5's measured hello (rjmotion/finch):
+        # plural key names, mic as an int, capability booleans alongside.
         codecs = ["h264"]
         if getattr(self.args, "hi_codec", "h264") == "h265":
             codecs.append("h265")
         return {
-            "mic": True,
+            "mic": 1,
             "aec": [],
             "videoMode": ["default"],
             "motionDetect": ["enhanced"],
-            "videoCodec": codecs,
+            "smartDetect": [],
             "videoCodecs": codecs,
-            "audioCodec": ["aac"],
             "audioCodecs": ["aac"],
+            "audioStyle": ["nature"],
+            "hasHdr": False,
+            "hasWdr": True,
+            "hasMic": True,
+            "hasSpeaker": False,
+            "hasInfrared": False,
+            "hasMotionZones": True,
+            "hasPrivacyMask": False,
+            "isPtz": False,
         }
 
     # API for subclasses
@@ -338,30 +348,47 @@ class UnifiCamBase(metaclass=ABCMeta):
         self.logger.info(
             f"Adopting with token [{self.args.token[:4]}…] and mac [{self.args.mac}]"
         )
-        await self.send(
-            self.gen_response(
-                "ubnt_avclient_hello",
-                payload={
-                    "adoptionCode": self.args.token,
-                    "connectionHost": self.args.host,
-                    "connectionSecurePort": 7442,
-                    "fwVersion": self.args.fw_version,
-                    "hwrev": 19,
-                    "idleTime": 191.96,
-                    "ip": self.args.ip,
-                    "mac": self.args.mac,
-                    "model": self.args.model,
-                    "name": self.args.name,
-                    "protocolVersion": 67,
-                    "rebootTimeoutSec": 30,
-                    "semver": "v4.4.8",
-                    "totalLoad": 0.5474,
-                    "upgradeTimeoutSec": 150,
-                    "uptime": int(self.get_uptime()),
-                    "features": await self.get_feature_flags(),
-                },
-            ),
-        )
+        payload: dict[str, Any] = {
+            "adoptionCode": self.args.token,
+            "connectionHost": self.args.host,
+            "connectionSecurePort": 7442,
+            "fwVersion": self.args.fw_version,
+            "hwrev": 19,
+            "idleTime": 191.96,
+            "ip": self.args.ip,
+            "mac": self.args.mac,
+            "model": self.args.model,
+            "name": self.args.name,
+            "protocolVersion": 67,
+            "rebootTimeoutSec": 30,
+            "semver": "v4.4.8",
+            "totalLoad": 0.5474,
+            "upgradeTimeoutSec": 150,
+            "uptime": int(self.get_uptime()),
+            "features": await self.get_feature_flags(),
+        }
+        if getattr(self.args, "sysid", None):
+            # Full identity block: Protect >=3.0 no longer copies `model`
+            # from the hello (service.js dropped `type: o.model`), so model
+            # recognition keys on sysid/platform/firmwareBuild plus the hex
+            # camera-model WSS header (core.py). fwVersion must be the
+            # SHORT form (e.g. "5.3.95") when this is used.
+            payload.update(
+                {
+                    "sysid": int(self.args.sysid, 0),
+                    "platform": self.args.platform,
+                    "firmwareBuild": self.args.fw_build,
+                    "semver": f"v{self.args.fw_version}",
+                    "hwaddr": ":".join(
+                        self.args.mac[i : i + 2] for i in range(0, 12, 2)
+                    ).lower(),
+                    "lensmodel": self.args.model,
+                    "cameraName": self.args.name,
+                    "isGen5s": True,
+                    "isDoorbellSeries": False,
+                }
+            )
+        await self.send(self.gen_response("ubnt_avclient_hello", payload=payload))
 
     async def process_hello(self, msg: AVClientRequest) -> None:
         controller_version = packaging.version.parse(
