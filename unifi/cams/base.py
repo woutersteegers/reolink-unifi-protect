@@ -1073,12 +1073,22 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         if not has_spawned or is_dead:
             source = await self.get_stream_source(stream_index)
+            # ffmpeg muxes HEVC into FLV as Enhanced-RTMP hvc1 extended
+            # tags, which Protect ingests but cannot decode; hevc_flv
+            # rewrites them into UniFi's codec-id-8 framing (see module).
+            hevc_filter = ""
+            if (
+                stream_index in ("", "video1")
+                and getattr(self.args, "hi_codec", "h264") == "h265"
+                and not self._hw_transcoding(stream_index)
+            ):
+                hevc_filter = f"{sys.executable} -m unifi.hevc_flv | "
             cmd = (
                 "ffmpeg -nostdin -loglevel error -y"
                 f" {self.get_base_ffmpeg_args(stream_index)} -rtsp_transport"
                 f' {self.args.rtsp_transport} -i "{source}"'
                 f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
-                f" streamName={stream_name} -f flv - | {sys.executable} -m"
+                f" streamName={stream_name} -f flv - | {hevc_filter}{sys.executable} -m"
                 " unifi.clock_sync"
                 f" {'--write-timestamps' if self._needs_flv_timestamps else ''} | nc"
                 f" {destination[0]} {destination[1]}"
