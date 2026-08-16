@@ -27,6 +27,27 @@ clock_sync trailer ticks in the trailer's own clock (90000/11025) →
 NAS clock 60s fast (ntpdate'd; ENABLE NTPD ON UNRAID) → config tag as
 byte1=1 + bare 2-byte-prefixed VPS/SPS/PPS (hvcC ⇒ codec VUNK).
 
+ALSO WORKING (2026-08-16, later):
+- **Audio**: clean after dropping -use_wallclock_as_timestamps (arrival
+  -time PTS = crackle; community consensus incl. Frigate's Reolink
+  presets) and passing the camera's AAC-LC 16k mono via -c:a copy.
+  NEVER aresample=async=1 (hard fill/trim = dropouts).
+- **Typed smart detections WITHOUT an AI Port**: rtsp source polls the
+  Reolink's on-camera AI (--reolink-ai-*, HTTPS GetAiState 1s) →
+  EventSmartDetect. Protect 7.x requirements (decompiled service.js):
+  payload must pass smartDetectObjectsTransformMessage — REQUIRED
+  displayTimeoutMSec, descriptors[] (trackerID:number, name,
+  confidenceLevel, coord[4], objectType, zones[], lines[],
+  stationary:false, coord3d[]), and zonesStatus values are
+  {status:"enter"|"leave"} OBJECTS not numbers. Event types are filled
+  ONLY from non-stationary descriptors. Feature key is
+  smartDetectTypes (smartDetect alone ignored). The camera needs a
+  smartDetectZone (added via DB) and answers to
+  ChangeSmartMotionSettings/SmartMotionTest (previously timed out).
+- Protect-side one-time DB tweaks (psql -p 5433 -d unifi-protect):
+  micVolume/isMicEnabled, smartDetectZones Default. Service restart
+  required after DB edits.
+
 Debugging access: UDM Pro SSH (root, ask Wouter; he enabled it
 2026-08-16). Protect logs: `/srv/unifi-protect/logs/` (node side),
 `/srv/ms/logs/ms.err.00.log` + `msr.00.log`/`msr.err.00.log` (media
