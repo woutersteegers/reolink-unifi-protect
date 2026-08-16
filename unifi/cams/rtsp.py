@@ -32,6 +32,7 @@ class RTSPCam(UnifiCamBase):
         self._sink_last_ts = 0.0
         self._sink_last_boxes_ts = 0.0
         self._ai_tracks: list = []
+        self._ai_track_seq = 0
         self._ai_active_lead = None
         self.stream_source = dict()
         for i, stream_index in enumerate(["video1", "video2", "video3"]):
@@ -224,7 +225,9 @@ class RTSPCam(UnifiCamBase):
                 if d < best:
                     best, track = d, t
             if track is None:
+                self._ai_track_seq += 1
                 track = {
+                    "id": self._ai_track_seq,
                     "type": box.get("type"),
                     "ox": cx,
                     "oy": cy,
@@ -232,6 +235,9 @@ class RTSPCam(UnifiCamBase):
                     "moved": 0.0,
                 }
                 self._ai_tracks.append(track)
+            # Stable per-object id: without it the Protect UI stacks a
+            # fresh box per update instead of moving one.
+            box["track_id"] = track["id"]
             track["cx"], track["cy"], track["last_ts"] = cx, cy, now
             track["moved"] = max(
                 track["moved"], abs(cx - track["ox"]) + abs(cy - track["oy"])
@@ -278,7 +284,9 @@ class RTSPCam(UnifiCamBase):
             if confidence < self._min_confidence(kind):
                 continue
             descriptors.append(
-                self.build_smart_descriptor(kind, coord, confidence, i)
+                self.build_smart_descriptor(
+                    kind, coord, confidence, box.get("track_id", 9000 + i)
+                )
             )
         if descriptors:
             self._sink_last_boxes_ts = time.time()

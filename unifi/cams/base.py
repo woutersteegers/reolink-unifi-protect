@@ -309,7 +309,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                     # smartDetectRaws) for callers with no coordinates.
                     descriptors = [
                         self.build_smart_descriptor(
-                            object_type.value, [250, 250, 500, 500], 0.9, 0
+                            object_type.value,
+                            [250, 250, 500, 500],
+                            0.9,
+                            (self._motion_event_id + 1) * 100,
                         )
                     ]
                 payload.update(
@@ -331,7 +334,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         # required) validation fails and the event saves
                         # with smartDetectTypes [] — shown as generic
                         # motion.
-                        "displayTimeoutMSec": 5000,
+                        "displayTimeoutMSec": self.SMART_DISPLAY_TIMEOUT_MS,
                         "descriptors": descriptors,
                     }
                 )
@@ -360,13 +363,20 @@ class UnifiCamBase(metaclass=ABCMeta):
             except FileNotFoundError:
                 pass
 
+    # Slightly above the sidecar's report interval so each box is
+    # replaced before it lingers — 5000 painted a comet trail of
+    # stale positions behind moving subjects.
+    SMART_DISPLAY_TIMEOUT_MS = 600
+
     def build_smart_descriptor(
-        self, object_type: str, coord: list, confidence: float, index: int
+        self, object_type: str, coord: list, confidence: float, tracker_id: int
     ) -> dict[str, Any]:
         # Shape per Protect 7.x's smartDetectObjectsTransformMessage
-        # schema; coord is 0-1000 [x, y, w, h].
+        # schema; coord is 0-1000 [x, y, w, h]. tracker_id must be
+        # STABLE per physical object across reports or the UI stacks a
+        # new box per update instead of moving one.
         return {
-            "trackerID": (self._motion_event_id + 1) * 100 + index,
+            "trackerID": int(tracker_id),
             "name": object_type,
             "confidenceLevel": int(round(confidence * 100)),
             "coord": [int(c) for c in coord],
@@ -399,7 +409,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventType": "motion",
             "objectTypes": sorted({d["objectType"] for d in descriptors}),
             "zonesStatus": {"1": {"status": "moving"}},
-            "displayTimeoutMSec": 5000,
+            "displayTimeoutMSec": self.SMART_DISPLAY_TIMEOUT_MS,
             "descriptors": descriptors,
         }
         await self.send(self.gen_response("EventSmartDetect", payload=payload))
@@ -429,7 +439,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "edgeType": "leave",
                         "zonesStatus": {"1": {"status": "leave"}},
                         "smartDetectSnapshot": "motionsnap.jpg",
-                        "displayTimeoutMSec": 5000,
+                        "displayTimeoutMSec": self.SMART_DISPLAY_TIMEOUT_MS,
                         "descriptors": [],
                     }
                 )
