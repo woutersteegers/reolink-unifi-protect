@@ -120,6 +120,13 @@ The genuinely novel reverse-engineering is written up in
   YOLO-World-generation firmware the widely-assumed `type1`/`type2` TLV
   semantics are **reversed** — `type2` is the per-object class.
 
+## Other camera sources
+
+Upstream's other sources (Amcrest, Dahua, Hikvision, Frigate, Reolink NVR,
+generic RTSP) are still present and benefit from the identity/codec work —
+see [`docs/sources/`](docs/sources) for their per-source options. The
+smart-detection bridge is currently wired into the `rtsp` source.
+
 ## Credits
 
 - [keshavdv/unifi-cam-proxy](https://github.com/keshavdv/unifi-cam-proxy) —

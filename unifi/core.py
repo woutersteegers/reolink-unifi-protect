@@ -38,9 +38,7 @@ class Core(object):
                     "camera-ip": self.args.ip,
                     "camera-firmware": self.args.fw_version,
                     "device-id": str(
-                        uuid.uuid5(
-                            uuid.NAMESPACE_DNS, f"unifi-cam-proxy-{self.mac}"
-                        )
+                        uuid.uuid5(uuid.NAMESPACE_DNS, f"unifi-cam-proxy-{self.mac}")
                     ),
                     "x-guid": str(uuid.uuid4()),
                 }

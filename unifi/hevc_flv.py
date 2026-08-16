@@ -73,14 +73,14 @@ def _hvcc_parameter_sets(record: bytes):
         if cursor + 3 > len(record):
             break
         kind = record[cursor] & 0x3F
-        count = int.from_bytes(record[cursor + 1: cursor + 3], "big")
+        count = int.from_bytes(record[cursor + 1 : cursor + 3], "big")
         cursor += 3
         for _ in range(count):
             if cursor + 2 > len(record):
                 break
-            size = int.from_bytes(record[cursor: cursor + 2], "big")
+            size = int.from_bytes(record[cursor : cursor + 2], "big")
             cursor += 2
-            unit = record[cursor: cursor + size]
+            unit = record[cursor : cursor + size]
             cursor += size
             if len(unit) == size and kind not in found:
                 found[kind] = unit
@@ -110,11 +110,11 @@ def _inband_parameter_sets(payload: bytes):
     found = {}
     cur = 0
     while cur + 4 <= len(payload):
-        size = int.from_bytes(payload[cur: cur + 4], "big")
+        size = int.from_bytes(payload[cur : cur + 4], "big")
         cur += 4
         if size <= 0 or cur + size > len(payload):
             break
-        unit = payload[cur: cur + size]
+        unit = payload[cur : cur + size]
         cur += size
         kind = (unit[0] >> 1) & 0x3F
         if kind in (32, 33, 34) and kind not in found:
@@ -186,8 +186,8 @@ def _extract_stream_name(body: bytes):
     cursor = at + len(marker)
     if cursor + 3 > len(body) or body[cursor] != 0x02:
         return None
-    length = int.from_bytes(body[cursor + 1: cursor + 3], "big")
-    value = body[cursor + 3: cursor + 3 + length]
+    length = int.from_bytes(body[cursor + 1 : cursor + 3], "big")
+    value = body[cursor + 3 : cursor + 3 + length]
     return value.decode("utf-8", errors="replace") if len(value) == length else None
 
 
@@ -260,9 +260,7 @@ def main() -> None:
             out[1:4] = len(out_body).to_bytes(3, "big")
             sink.write(bytes(out))
             sink.write(out_body)
-            sink.write(
-                (TAG_HEADER_LEN + len(out_body)).to_bytes(PREV_SIZE_LEN, "big")
-            )
+            sink.write((TAG_HEADER_LEN + len(out_body)).to_bytes(PREV_SIZE_LEN, "big"))
         sink.flush()
 
 

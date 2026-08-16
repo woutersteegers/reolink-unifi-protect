@@ -197,9 +197,9 @@ class UnifiCamBase(metaclass=ABCMeta):
         return stream_index in ("", "video1")
 
     def _lo_h265_transcoding(self, stream_index: str = "") -> bool:
-        return (
-            getattr(self.args, "lo_h265_transcode", False)
-            and stream_index in ("video2", "video3")
+        return getattr(self.args, "lo_h265_transcode", False) and stream_index in (
+            "video2",
+            "video3",
         )
 
     def _emits_h265(self, stream_index: str = "") -> bool:
@@ -217,10 +217,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         if self._lo_h265_transcoding(stream_index):
             # Same dimensions in and out — no scaler, decode straight
             # into hevc_qsv on the iGPU.
-            return (
-                f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
-                " -c:a copy"
-            )
+            return f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}" " -c:a copy"
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if self._hw_transcoding(stream_index):
             return (
@@ -317,9 +314,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     ]
                 payload.update(
                     {
-                        "objectTypes": sorted(
-                            {d["objectType"] for d in descriptors}
-                        ),
+                        "objectTypes": sorted({d["objectType"] for d in descriptors}),
                         "edgeType": "enter",
                         # zonesStatusesSchema: record of OBJECTS with a
                         # status label — a bare number fails the whole

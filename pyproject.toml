@@ -6,17 +6,16 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "unifi-cam-proxy"
 description = "Enable non-Ubiquiti cameras to work with Unifi NVR"
-requires-python = ">=3.9"
+requires-python = ">=3.12"
 authors = [
     { name = "Keshav Varma", email = "keshavdv@gmail.com" },
+    { name = "Wouter Steegers", email = "wouter@steegers.io" },
 ]
 license = { text = "MIT" }
 dynamic = ["dependencies", "readme", "version"]
 classifiers = [
     "License :: OSI Approved :: MIT License",
-    "Programming Language :: Python :: 3.9",
-    "Programming Language :: Python :: 3.10",
-    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
 ]
 keywords = [
     "unifi",
@@ -26,10 +25,10 @@ keywords = [
 
 
 [project.urls]
-"Homepage" = "https://github.com/keshavdv/unifi-cam-proxy"
-"Bug Tracker" = "https://github.com/keshavdv/unifi-cam-proxy/issues"
-"Source Code" = "https://github.com/keshavdv/unifi-cam-proxy"
-"Documentation" = "https://unifi-cam-proxy.com/"
+"Homepage" = "https://github.com/woutersteegers/reolink-unifi-protect"
+"Bug Tracker" = "https://github.com/woutersteegers/reolink-unifi-protect/issues"
+"Source Code" = "https://github.com/woutersteegers/reolink-unifi-protect"
+"Upstream" = "https://github.com/keshavdv/unifi-cam-proxy"
 
 
 [project.optional-dependencies]
@@ -39,8 +38,6 @@ test = [
     "flake8",
     "flake8-bugbear",
     "pre-commit",
-    "pyre-check",
-    "pytest",
     "wheel"
 ]
 all = ["unifi-cam-proxy[test]"]
