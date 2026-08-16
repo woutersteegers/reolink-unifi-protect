@@ -49,6 +49,12 @@ services:
       # honest h265 declaration on video1.
       - --model
       - "UVC G5 Pro"
+      # Firmware string must match the model's platform or Protect files the
+      # camera as generic "Camera": G5 Pro platform is sav530q (per
+      # github.com/priiduonu/uvcfwlinks); the flag's default is a 2020
+      # G3/S2L string. Version tracks the 5.1.x camera firmware line.
+      - --fw-version
+      - "UVC.sav530q.v5.1.217.0eba6e3.260815.2100"
       - rtsp
       - -s
       - "rtsp://${CAM_USER}:${CAM_PASS}@${CAM_IP}:554/h264Preview_01_main"

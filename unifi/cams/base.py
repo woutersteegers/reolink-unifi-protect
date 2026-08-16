@@ -192,11 +192,28 @@ class UnifiCamBase(metaclass=ABCMeta):
         return self.args.ffmpeg_args
 
     async def get_feature_flags(self) -> dict[str, Any]:
+        # Protect gates codec support on the CAPABILITIES the camera reports,
+        # not on the per-channel "type" in ChangeVideoSettings: the bootstrap
+        # keeps a camera-level videoCodec (default h264) that governs decode,
+        # and the "enhanced encoding" (H.265) option only exists when the
+        # camera's featureFlags.videoCodecs contains "h265" (observed empty
+        # for this proxy vs ["h264","h265",...] on real G6/Doorbell cams).
+        # Protect renames feature keys on ingest (videoMode->videoModes,
+        # motionDetect->motionAlgorithms), so the camera-side key for the
+        # codec list is uncertain — send singular and plural forms; unknown
+        # keys are ignored.
+        codecs = ["h264"]
+        if getattr(self.args, "hi_codec", "h264") == "h265":
+            codecs.append("h265")
         return {
             "mic": True,
             "aec": [],
             "videoMode": ["default"],
             "motionDetect": ["enhanced"],
+            "videoCodec": codecs,
+            "videoCodecs": codecs,
+            "audioCodec": ["aac"],
+            "audioCodecs": ["aac"],
         }
 
     # API for subclasses
@@ -471,9 +488,11 @@ class UnifiCamBase(metaclass=ABCMeta):
                     "enabled": True,
                     "mode": 0,
                     "quality": 0,
-                    "sampleRate": 11025,
+                    # Match what ffmpeg actually sends (-ar 32000); volume 0
+                    # made Protect store micVolume=0 / mic disabled.
+                    "sampleRate": 32000,
                     "type": "aac",
-                    "volume": 0,
+                    "volume": 100,
                 },
                 "firmwarePath": "/lib/firmware/",
                 "video": {
@@ -481,6 +500,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     "hdrMode": 0,
                     "lowDelay": False,
                     "videoMode": "default",
+                    "videoCodec": self.args.hi_codec,
                     "mjpg": {
                         "avSerializer": {
                             "destinations": [

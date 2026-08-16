@@ -105,6 +105,28 @@ Feed the camera into UniFi Protect with **NO transcoding at all**:
   (main + sub×2; video2 and video3 each spawn their own ffmpeg). The
   `--snapshot-url` HTTPS path avoids a 4th. If streams respawn-loop after
   adoption, suspect the session limit first.
+- **THE CODEC IS CONTROLLER-DRIVEN, NOT CAMERA-DECLARED** (bootstrap dump
+  2026-08-15 + research on decompiled Protect 7.1.77 service.js via
+  github.com/MicahZoltu/unifi-rtsp-converter). Protect keeps a camera-level
+  `videoCodec` (default h264) that governs decode/playback; it COMMANDS the
+  codec via ChangeVideoSettings per-channel `"type"` and treats the
+  camera's response as an ack. Declaring h265 in our response does nothing.
+  The "enhanced encoding" (h265) option only appears when
+  `featureFlags.videoCodecs` contains "h265" — real G6/Doorbell report
+  `["h264","h265",...]`, the proxy reported `[]`. Fix attempt: advertise
+  videoCodec(s) in get_feature_flags(); open question was whether Protect
+  refreshes featureFlags on reconnect or only at adoption.
+- **Diagnostic**: bootstrap `stats.video.recordingStart` null while
+  `recordingStartLQ` is set + `channelStorage` only has "2" → Protect
+  records the H.264 LQ channel but discards the mislabeled h265 HQ channel.
+  Watch this flip when the codec experiment works.
+- **Wire format** (redalert fork's capture docs): real cameras prepend an
+  11-byte uPFLV magic `DE 19 16 15 47 17 DE 19 16 75 50` before the FLV
+  header and use Enhanced-RTMP extended video tags (fourcc hvc1 for HEVC —
+  same framing ffmpeg 6.1+ emits). Our stream lacks the magic prefix yet is
+  ingested fine on Protect 7.1.87. Newer Protect may start validating it.
+- **Nobody has ever demonstrated h265 through unifi-cam-proxy** (all forks
+  and issues end in transcode-to-h264). This experiment is novel.
 
 ## Runbook (fresh deploy)
 
