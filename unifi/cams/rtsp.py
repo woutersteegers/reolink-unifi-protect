@@ -85,6 +85,12 @@ class RTSPCam(UnifiCamBase):
             type=int,
             help="Port to receive AI box reports from the sidecar",
         )
+        parser.add_argument(
+            "--ai-min-confidence",
+            default=0.75,
+            type=float,
+            help="Ignore AI detections below this confidence (0-1)",
+        )
 
     def start_snapshot_stream(self) -> None:
         if not self.snapshot_stream or self.snapshot_stream.poll() is not None:
@@ -164,10 +170,11 @@ class RTSPCam(UnifiCamBase):
             coord = box.get("coord")
             if kind not in priority or not coord or len(coord) != 4:
                 continue
+            confidence = float(box.get("confidence") or 0.8)
+            if confidence < self.args.ai_min_confidence:
+                continue
             descriptors.append(
-                self.build_smart_descriptor(
-                    kind, coord, float(box.get("confidence") or 0.8), i
-                )
+                self.build_smart_descriptor(kind, coord, confidence, i)
             )
         if descriptors:
             self._sink_last_boxes_ts = time.time()

@@ -84,6 +84,8 @@ services:
       # GetAiState poller above stands down while reports are fresh.
       - --ai-sink-port
       - "7999"
+      - --ai-min-confidence
+      - "0.75"
       # Audio passthrough (AAC-LC 16k mono, the real UniFi wire format).
       # Timestamps come from the camera's RTP clock (wallclock stamping
       # removed in base.py) so the samples line up gaplessly.
