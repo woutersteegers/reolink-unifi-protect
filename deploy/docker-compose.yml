@@ -86,11 +86,12 @@ services:
       - "7999"
       - --ai-min-confidence
       - "0.75"
-      # The camera's dog_cat detector misfires on people; make animal
-      # detections clear a higher bar. Drop 'animal' from --ai-classes
-      # instead to disable the class entirely.
+      # With the sidecar's LABEL_REMAP in place the animal label is real
+      # animals again (plus the low-confidence 30-40% scenery flicker
+      # that used to arrive as person) — 0.8 passes actual dogs while
+      # still burying the flicker.
       - --ai-confidence-overrides
-      - "animal=0.95"
+      - "animal=0.8"
       # Audio passthrough (AAC-LC 16k mono, the real UniFi wire format).
       # Timestamps come from the camera's RTP clock (wallclock stamping
       # removed in base.py) so the samples line up gaplessly.
