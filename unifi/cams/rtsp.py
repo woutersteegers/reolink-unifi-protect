@@ -34,6 +34,7 @@ class RTSPCam(UnifiCamBase):
         self._ai_tracks: list = []
         self._ai_track_seq = 0
         self._ai_active_lead = None
+        self._ai_class_state: dict = {}
         self.stream_source = dict()
         for i, stream_index in enumerate(["video1", "video2", "video3"]):
             if not i < len(self.args.source):
@@ -274,6 +275,27 @@ class RTSPCam(UnifiCamBase):
             self.logger.info(f"AI raw: {raw}")
         boxes = self._filter_stationary(boxes)
         priority = [c.strip() for c in self.args.ai_classes.split(",") if c.strip()]
+
+        # Relabel from the authoritative class state (GetAiState poller):
+        # the sidecar's box labels are a shape guess at best. With a
+        # single active class every box is that class; with several, keep
+        # the shape guess if it's plausible, else assign the top active.
+        now = time.time()
+        active = [
+            t
+            for t in priority
+            if now - self._ai_class_state.get(t, 0) < 3.0
+        ]
+        if active:
+            for box in boxes:
+                if box.get("type") not in active:
+                    box["type"] = active[0]
+                if len(active) == 1:
+                    box["type"] = active[0]
+        elif not self._motion_event_ts:
+            # No class authority yet (poll lag ≤1s): hold off starting an
+            # event under a guessed label; the next report will know.
+            return
         descriptors = []
         for i, box in enumerate(boxes):
             kind = box.get("type")
@@ -349,11 +371,6 @@ class RTSPCam(UnifiCamBase):
         active: Optional[SmartDetectObjectType] = None
         async with aiohttp.ClientSession() as session:
             while True:
-                # The box sidecar is authoritative while it's alive; the
-                # coarse poller only acts as fallback.
-                if time.time() - self._sink_last_ts < 10:
-                    await asyncio.sleep(self.args.reolink_ai_interval)
-                    continue
                 try:
                     async with session.get(
                         url, ssl=False, timeout=aiohttp.ClientTimeout(total=5)
@@ -361,12 +378,24 @@ class RTSPCam(UnifiCamBase):
                         data = await resp.json(content_type=None)
                     value = data[0].get("value", {})
                     desired = None
+                    now = time.time()
                     for key, object_type in classes:
                         entry = value.get(key) or {}
                         if entry.get("support") and entry.get("alarm_state"):
-                            desired = object_type
-                            break
-                    if desired and active is None:
+                            # CLASS AUTHORITY for the box sink: GetAiState
+                            # is the same detector state the Reolink app
+                            # labels from (always right in practice); the
+                            # Baichuan box wrappers carry no class at all
+                            # on this firmware (identical confidence under
+                            # every wrapper).
+                            self._ai_class_state[object_type.value] = now
+                            if desired is None:
+                                desired = object_type
+                    # While the box sidecar is alive it drives the events;
+                    # the poller then only maintains the class states.
+                    if time.time() - self._sink_last_ts < 10:
+                        active = None
+                    elif desired and active is None:
                         self.logger.info(f"Reolink AI: {desired.value} detected")
                         await self.trigger_motion_start(desired)
                         active = desired

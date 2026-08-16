@@ -33,10 +33,19 @@ const REMAP = Object.fromEntries(
 
 let latest = [];
 
-// Ambiguity tie-break when several class copies share the top
-// confidence: prefer person (matches what the official app displays for
-// a walking human, which populates every wrapper on this firmware).
-const TIE_ORDER = { people: 3, animal: 2, vehicle: 1, unknown: 0 };
+// Ground truth measured on this firmware (Elite Floodlight, YOLO-World
+// generation): a tracked object's box appears under ALL class wrappers
+// with IDENTICAL confidence — the wrappers carry no class information.
+// What does discriminate is geometry: a standing/walking human is tall
+// (h ≳ 2w), a dog is wider than tall, a vehicle is much wider and much
+// bigger. Arbitrate ambiguous multi-wrapper ties by shape; boxes that
+// appear under a single wrapper keep that specific label.
+function arbitrate(labels, w, h) {
+  if (labels.size === 1) return [...labels][0];
+  if (h >= 1.35 * w) return "people";
+  if (w >= 2.0 * h && w >= 150) return "vehicle";
+  return "animal";
+}
 let lastCopyLog = 0;
 
 function mapEvent(event) {
@@ -65,12 +74,11 @@ function mapEvent(event) {
 
   const boxes = [];
   for (const g of groups.values()) {
-    g.sort(
-      (a, b) =>
-        b.conf - a.conf || (TIE_ORDER[b.label] ?? 0) - (TIE_ORDER[a.label] ?? 0),
-    );
-    const best = g[0];
-    let type = LABELS[best.label];
+    const best = g.reduce((a, b) => (b.conf > a.conf ? b : a));
+    const w = best.x2 - best.x1;
+    const h = best.y2 - best.y1;
+    const label = arbitrate(new Set(g.map((c) => c.label)), w, h);
+    let type = LABELS[label];
     if (!type) continue;
     type = REMAP[type] || type;
     boxes.push({
@@ -79,8 +87,8 @@ function mapEvent(event) {
       coord: [
         Math.round((best.x1 / frameWidth) * 1000),
         Math.round((best.y1 / frameHeight) * 1000),
-        Math.round(((best.x2 - best.x1) / frameWidth) * 1000),
-        Math.round(((best.y2 - best.y1) / frameHeight) * 1000),
+        Math.round((w / frameWidth) * 1000),
+        Math.round((h / frameHeight) * 1000),
       ],
     });
   }
