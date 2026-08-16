@@ -15,6 +15,11 @@ from unifi.cams.base import SmartDetectObjectType, UnifiCamBase
 
 class RTSPCam(UnifiCamBase):
     AI_CLEAR_AFTER_SEC = 2.5
+    # Movement-gate tracker: boxes must displace before they count.
+    AI_TRACK_MATCH_RADIUS = 60  # centre distance to join an existing track
+    AI_TRACK_EXPIRE_SEC = 3.0  # forget a moving track this long after loss
+    AI_STATIC_EXPIRE_SEC = 60.0  # remember never-moved spots much longer
+    # so an intermittently re-detected building stays suppressed
 
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
         super().__init__(args, logger)
@@ -26,6 +31,7 @@ class RTSPCam(UnifiCamBase):
         self.sink_runner = None
         self._sink_last_ts = 0.0
         self._sink_last_boxes_ts = 0.0
+        self._ai_tracks: list = []
         self.stream_source = dict()
         for i, stream_index in enumerate(["video1", "video2", "video3"]):
             if not i < len(self.args.source):
@@ -90,6 +96,13 @@ class RTSPCam(UnifiCamBase):
             default=0.75,
             type=float,
             help="Ignore AI detections below this confidence (0-1)",
+        )
+        parser.add_argument(
+            "--ai-min-movement",
+            default=10,
+            type=int,
+            help="Suppress boxes until they move this far (0-1000 units;"
+            " kills stationary false positives like buildings; 0 disables)",
         )
 
     def start_snapshot_stream(self) -> None:
@@ -161,8 +174,63 @@ class RTSPCam(UnifiCamBase):
             self.logger.exception("Failed to process AI box report")
         return web.Response(text="ok")
 
+    def _filter_stationary(self, boxes: list) -> list:
+        """Drop boxes that have never moved.
+
+        Scenery misclassified by the camera (a distant house read as a
+        person, a parked car) produces a box that sits still; anything
+        real displaces within a report or two. Tracks that never moved
+        are remembered for a long time so intermittent re-detections of
+        the same spot stay suppressed.
+        """
+        if not self.args.ai_min_movement:
+            return boxes
+        now = time.time()
+        self._ai_tracks = [
+            t
+            for t in self._ai_tracks
+            if now - t["last_ts"]
+            < (
+                self.AI_TRACK_EXPIRE_SEC
+                if t["moved"] >= self.args.ai_min_movement
+                else self.AI_STATIC_EXPIRE_SEC
+            )
+        ]
+        out = []
+        for box in boxes:
+            coord = box.get("coord") or []
+            if len(coord) != 4:
+                continue
+            cx = coord[0] + coord[2] / 2
+            cy = coord[1] + coord[3] / 2
+            track = None
+            best = self.AI_TRACK_MATCH_RADIUS
+            for t in self._ai_tracks:
+                if t["type"] != box.get("type"):
+                    continue
+                d = abs(t["cx"] - cx) + abs(t["cy"] - cy)
+                if d < best:
+                    best, track = d, t
+            if track is None:
+                track = {
+                    "type": box.get("type"),
+                    "ox": cx,
+                    "oy": cy,
+                    "first_ts": now,
+                    "moved": 0.0,
+                }
+                self._ai_tracks.append(track)
+            track["cx"], track["cy"], track["last_ts"] = cx, cy, now
+            track["moved"] = max(
+                track["moved"], abs(cx - track["ox"]) + abs(cy - track["oy"])
+            )
+            if track["moved"] >= self.args.ai_min_movement:
+                out.append(box)
+        return out
+
     async def _on_ai_boxes(self, boxes: list) -> None:
         self._sink_last_ts = time.time()
+        boxes = self._filter_stationary(boxes)
         priority = ["person", "vehicle", "animal"]
         descriptors = []
         for i, box in enumerate(boxes):
