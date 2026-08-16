@@ -18,13 +18,26 @@ const LABELS = {
   dog_cat: "animal",
 };
 
+// Per-model wire-class correction. nodelink's type1 mapping was
+// verified on an E1 Zoom; the Elite Floodlight WiFi delivers PERSON
+// boxes on the slot nodelink labels "animal" (a walking human logged
+// as animal@94% in a 1:4.5 tall box while the Reolink app said
+// person). Format: "from=to,from=to".
+const REMAP = Object.fromEntries(
+  (process.env.LABEL_REMAP || "")
+    .split(",")
+    .filter((s) => s.includes("="))
+    .map((s) => s.split("=").map((x) => x.trim())),
+);
+
 let latest = [];
 
 function mapEvent(event) {
   const boxes = [];
   for (const b of event.boxes) {
-    const type = LABELS[(b.label || "").toLowerCase()];
+    let type = LABELS[(b.label || "").toLowerCase()];
     if (!type) continue;
+    type = REMAP[type] || type;
     boxes.push({
       type,
       confidence: b.confidence ?? 0.8,

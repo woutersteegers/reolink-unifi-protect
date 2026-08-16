@@ -129,3 +129,6 @@ services:
       - CAM_USER=${CAM_USER}
       - CAM_PASS=${CAM_PASS}
       - SINK_URL=http://reolink-floodlight-proxy:7999/detections
+      # Elite Floodlight delivers person boxes on the wire slot nodelink
+      # labels "animal" (and vice versa presumed) — swap them.
+      - LABEL_REMAP=animal=person,person=animal
