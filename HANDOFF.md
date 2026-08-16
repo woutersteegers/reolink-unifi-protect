@@ -48,6 +48,35 @@ ALSO WORKING (2026-08-16, later):
   micVolume/isMicEnabled, smartDetectZones Default. Service restart
   required after DB edits.
 
+FINAL SMART-DETECTION ARCHITECTURE (2026-08-16, all verified working):
+- **Real moving boxes** from the camera's own AI via the Baichuan
+  protocol: deploy/ai-sidecar (Node) decodes the BcMedia
+  additionalHeader TLVs ITSELF (decode.mjs) — nodelink-js is used only
+  for transport/session.
+- **KEY REVERSE-ENGINEERING FINDING (worth upstreaming to nodelink-js):
+  on YOLO-World-generation cameras (this Elite Floodlight, AI fw
+  2025+), nodelink's (type1=class, type2=view) model is REVERSED:
+  type2 IS the per-object class (1=people, 2=vehicle, 3=animal) and
+  type1 is the view index (SDK's 3-views layout; per-view box lengths
+  10/14/13 caused nodelink's "length varies by class" illusion; view
+  2/3 extras start with a u16 LE stable track id). Every copy of one
+  physical box shares one type2. Verified live with dog+person+static
+  house simultaneously in frame.
+- Proxy (rtsp.py --ai-sink-port): events with per-object descriptors,
+  edgeType moving updates (box follows subject), stable trackerIDs from
+  the movement-gate tracker, displayTimeoutMSec 600 (5000 painted box
+  trails). Filters: --ai-min-confidence 0.75,
+  --ai-confidence-overrides animal=0.6, --ai-min-movement 10 (never-
+  moved scenery suppressed — kills the far-house false positive),
+  --ai-classes priority. Class-upgrade retype (animal->person) kept.
+- GetAiState HTTPS poller = fallback events when the sidecar is dead
+  (>10s stale).
+- Camera-side: gop=1 both streams via SetEnc (viewer-join latency);
+  generic ack in base.process() for ALL responseExpected requests
+  (Protect 7.x stalls 5s per unanswered settings request).
+- Debug: "AI raw" (proxy, 1/s) and "copies/odd-tlv" (sidecar, 1/s)
+  logs show the ground truth per box — keep for tuning.
+
 Debugging access: UDM Pro SSH (root, ask Wouter; he enabled it
 2026-08-16). Protect logs: `/srv/unifi-protect/logs/` (node side),
 `/srv/ms/logs/ms.err.00.log` + `msr.00.log`/`msr.err.00.log` (media
