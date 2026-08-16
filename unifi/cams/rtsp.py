@@ -276,26 +276,9 @@ class RTSPCam(UnifiCamBase):
         boxes = self._filter_stationary(boxes)
         priority = [c.strip() for c in self.args.ai_classes.split(",") if c.strip()]
 
-        # Relabel from the authoritative class state (GetAiState poller):
-        # the sidecar's box labels are a shape guess at best. With a
-        # single active class every box is that class; with several, keep
-        # the shape guess if it's plausible, else assign the top active.
-        now = time.time()
-        active = [
-            t
-            for t in priority
-            if now - self._ai_class_state.get(t, 0) < 3.0
-        ]
-        if active:
-            for box in boxes:
-                if box.get("type") not in active:
-                    box["type"] = active[0]
-                if len(active) == 1:
-                    box["type"] = active[0]
-        elif not self._motion_event_ts:
-            # No class authority yet (poll lag ≤1s): hold off starting an
-            # event under a guessed label; the next report will know.
-            return
+        # Box classes come straight off the wire now (type2 = class on
+        # this firmware, per-object, same source the app labels from) —
+        # no relabeling needed.
         descriptors = []
         for i, box in enumerate(boxes):
             kind = box.get("type")

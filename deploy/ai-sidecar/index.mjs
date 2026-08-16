@@ -33,19 +33,14 @@ const REMAP = Object.fromEntries(
 
 let latest = [];
 
-// Ground truth measured on this firmware (Elite Floodlight, YOLO-World
-// generation): a tracked object's box appears under ALL class wrappers
-// with IDENTICAL confidence — the wrappers carry no class information.
-// What does discriminate is geometry: a standing/walking human is tall
-// (h ≳ 2w), a dog is wider than tall, a vehicle is much wider and much
-// bigger. Arbitrate ambiguous multi-wrapper ties by shape; boxes that
-// appear under a single wrapper keep that specific label.
-function arbitrate(labels, w, h) {
-  if (labels.size === 1) return [...labels][0];
-  if (h >= 1.35 * w) return "people";
-  if (w >= 2.0 * h && w >= 150) return "vehicle";
-  return "animal";
-}
+// MEASURED on this firmware (Elite Floodlight, YOLO-World generation):
+// nodelink's (type1=class, type2=view) model is REVERSED here — every
+// copy of one physical box shares one type2 and that type2 IS the
+// class (1=people, 2=vehicle, 3=animal, matching the SDK enum), while
+// type1 is the view index (the SDK's "3 views x 4 class arrays"; view
+// lengths 10/14/13 explain the length-by-wrapper illusion). Verified
+// live: dog box t2=3, its human t2=1, the static far house t2=2.
+const T2_CLASS = { 1: "people", 2: "vehicle", 3: "animal" };
 let lastCopyLog = 0;
 
 function mapEvent(event) {
@@ -55,7 +50,12 @@ function mapEvent(event) {
   // Group the per-class wrapper copies of each physical box and pick
   // the label by highest per-copy confidence.
   const groups = new Map();
+  const odd = [];
   for (const c of copies) {
+    if (c.odd) {
+      odd.push(c);
+      continue;
+    }
     if (c.x2 > frameWidth || c.y2 > frameHeight || c.x2 <= c.x1 || c.y2 <= c.y1)
       continue;
     const key = `${c.x1}_${c.y1}_${c.x2}_${c.y2}`;
@@ -66,9 +66,15 @@ function mapEvent(event) {
     lastCopyLog = Date.now();
     for (const [key, g] of groups) {
       const detail = g
-        .map((c) => `${c.label}@${c.conf}(len${c.len}${c.extras ? ",x=" + c.extras : ""})`)
+        .map(
+          (c) =>
+            `${c.label}/t2=${c.t2}@${c.conf}(len${c.len}${c.extras ? ",x=" + c.extras : ""})`,
+        )
         .join(" ");
       console.log(`copies [${key}]: ${detail}`);
+    }
+    for (const o of odd.slice(0, 8)) {
+      console.log(`odd-tlv t1=${o.t1} t2=${o.t2} t=${o.t} len=${o.len} ${o.hex}`);
     }
   }
 
@@ -77,8 +83,7 @@ function mapEvent(event) {
     const best = g.reduce((a, b) => (b.conf > a.conf ? b : a));
     const w = best.x2 - best.x1;
     const h = best.y2 - best.y1;
-    const label = arbitrate(new Set(g.map((c) => c.label)), w, h);
-    let type = LABELS[label];
+    let type = LABELS[T2_CLASS[best.t2]];
     if (!type) continue;
     type = REMAP[type] || type;
     boxes.push({

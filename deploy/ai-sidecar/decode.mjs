@@ -37,6 +37,25 @@ function walk(buf, pos, end, type1, type2, out) {
 
     const isBox4 = t === 4 && (length === 10 || length === 13 || length === 14);
     const isBox2 = t === 2 && length === 10;
+    // Capture leaf-sized TLVs we do NOT recognize as boxes: the SDK's
+    // "view1 tracked-with-ID" records may use other type/length combos
+    // that nodelink's box filter (and ours) silently skips.
+    if (
+      !(isBox4 || isBox2) &&
+      type1 !== 0 &&
+      type2 !== 0 &&
+      length >= 8 &&
+      length <= 24
+    ) {
+      out.push({
+        odd: true,
+        t1: type1,
+        t2: type2,
+        t,
+        len: length,
+        hex: buf.subarray(pos + 3, recordEnd).toString("hex"),
+      });
+    }
     if ((isBox4 || isBox2) && type1 !== 0 && type2 !== 0) {
       if (pos + 13 <= end) {
         out.push({
