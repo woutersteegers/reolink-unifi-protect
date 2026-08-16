@@ -2,6 +2,7 @@ import argparse
 import atexit
 import json
 import logging
+import re
 import shutil
 import ssl
 import subprocess
@@ -119,6 +120,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         )
         parser.add_argument("--hi-width", default=1920, type=int)
         parser.add_argument("--hi-height", default=1080, type=int)
+        parser.add_argument("--hi-fps", default=15, type=int)
         parser.add_argument(
             "--lo-codec",
             default="h264",
@@ -127,6 +129,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         )
         parser.add_argument("--lo-width", default=1280, type=int)
         parser.add_argument("--lo-height", default=720, type=int)
+        parser.add_argument("--lo-fps", default=15, type=int)
 
     async def _run(self, ws) -> None:
         self._session = ws
@@ -160,6 +163,13 @@ class UnifiCamBase(metaclass=ABCMeta):
     @abstractmethod
     async def get_stream_source(self, stream_index: str) -> str:
         raise NotImplementedError("You need to write this!")
+
+    @staticmethod
+    def redact_secrets(text: str) -> str:
+        # `docker logs` is shared freely; stream URLs carry the camera
+        # password (rtsp://user:pass@host), so scrub credentials before any
+        # command line or URL is logged.
+        return re.sub(r"//[^/@\s\"]+@", "//***:***@", text)
 
     def _hw_transcoding(self, stream_index: str = "") -> bool:
         # Only the HIGH-quality stream is transcoded. Protect opens several
@@ -290,7 +300,9 @@ class UnifiCamBase(metaclass=ABCMeta):
 
     async def fetch_to_file(self, url: str, dst: Path) -> bool:
         try:
-            async with aiohttp.request("GET", url) as resp:
+            # ssl=False: snapshot URLs point at LAN cameras with self-signed
+            # certs (this Reolink is HTTPS-only), which fail verification.
+            async with aiohttp.request("GET", url, ssl=False) as resp:
                 if resp.status != 200:
                     self.logger.error(f"Error retrieving file {resp.status}")
                     return False
@@ -307,7 +319,7 @@ class UnifiCamBase(metaclass=ABCMeta):
 
     async def init_adoption(self) -> None:
         self.logger.info(
-            f"Adopting with token [{self.args.token}] and mac [{self.args.mac}]"
+            f"Adopting with token [{self.args.token[:4]}…] and mac [{self.args.mac}]"
         )
         await self.send(
             self.gen_response(
@@ -527,7 +539,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "bitRateVbrMin": 48000,
                         "description": "Hi quality video track",
                         "enabled": True,
-                        "fps": 15,
+                        "fps": self.args.hi_fps,
                         "gopModel": 0,
                         "height": self.args.hi_height,
                         "horizontalFlip": False,
@@ -587,7 +599,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "currentVbrBitrate": 1200000,
                         "description": "Medium quality video track",
                         "enabled": True,
-                        "fps": 15,
+                        "fps": self.args.lo_fps,
                         "gopModel": 0,
                         "height": self.args.lo_height,
                         "horizontalFlip": False,
@@ -600,7 +612,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "sourceId": 1,
                         "streamId": 2,
                         "streamOrdinal": 1,
-                        "type": "h264",
+                        "type": self.args.lo_codec,
                         "validBitrateRangeMax": 1500000,
                         "validBitrateRangeMin": 32000,
                         "validFpsValues": [
@@ -647,7 +659,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "currentVbrBitrate": 200000,
                         "description": "Low quality video track",
                         "enabled": True,
-                        "fps": 15,
+                        "fps": self.args.lo_fps,
                         "gopModel": 0,
                         "height": self.args.lo_height,
                         "horizontalFlip": False,
@@ -660,7 +672,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "sourceId": 2,
                         "streamId": 4,
                         "streamOrdinal": 2,
-                        "type": "h264",
+                        "type": self.args.lo_codec,
                         "validBitrateRangeMax": 750000,
                         "validBitrateRangeMin": 32000,
                         "validFpsValues": [
@@ -1029,7 +1041,8 @@ class UnifiCamBase(metaclass=ABCMeta):
                 self.logger.warn(f"Previous ffmpeg process for {stream_index} died.")
 
             self.logger.info(
-                f"Spawning ffmpeg for {stream_index} ({stream_name}): {cmd}"
+                f"Spawning ffmpeg for {stream_index} ({stream_name}):"
+                f" {self.redact_secrets(cmd)}"
             )
             self._ffmpeg_handles[stream_index] = subprocess.Popen(
                 cmd, stdout=subprocess.DEVNULL, shell=True
