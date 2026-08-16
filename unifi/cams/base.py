@@ -130,6 +130,21 @@ class UnifiCamBase(metaclass=ABCMeta):
         parser.add_argument("--lo-width", default=1280, type=int)
         parser.add_argument("--lo-height", default=720, type=int)
         parser.add_argument("--lo-fps", default=15, type=int)
+        # With camera-level videoCodec=h265 (enhanced encoding) Protect
+        # expects EVERY channel to carry HEVC and skips H.264 segments
+        # (msr: "TranscodeSegment codec mismatch"). This QSV-encodes the
+        # already-H.264 lo channels to HEVC on the iGPU — 1920x576@30
+        # measured ~4.4x realtime, so two channels fit easily.
+        parser.add_argument(
+            "--lo-h265-transcode",
+            action="store_true",
+            help="QSV-transcode the medium/low channels to H.265",
+        )
+        parser.add_argument(
+            "--lo-transcode-bitrate",
+            default="1M",
+            help="Bitrate for --lo-h265-transcode",
+        )
 
     async def _run(self, ws) -> None:
         self._session = ws
@@ -180,7 +195,31 @@ class UnifiCamBase(metaclass=ABCMeta):
             return False
         return stream_index in ("", "video1")
 
+    def _lo_h265_transcoding(self, stream_index: str = "") -> bool:
+        return (
+            getattr(self.args, "lo_h265_transcode", False)
+            and stream_index in ("video2", "video3")
+        )
+
+    def _emits_h265(self, stream_index: str = "") -> bool:
+        # Channels whose FLV output carries HEVC and therefore needs the
+        # unifi.hevc_flv rewrite before clock_sync.
+        if self._lo_h265_transcoding(stream_index):
+            return True
+        return (
+            stream_index in ("", "video1")
+            and getattr(self.args, "hi_codec", "h264") == "h265"
+            and not self._hw_transcoding(stream_index)
+        )
+
     def get_extra_ffmpeg_args(self, stream_index: str = "") -> str:
+        if self._lo_h265_transcoding(stream_index):
+            # Same dimensions in and out — no scaler, decode straight
+            # into hevc_qsv on the iGPU.
+            return (
+                f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
+                " -ar 32000 -ac 1 -codec:a aac -b:a 32k"
+            )
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if self._hw_transcoding(stream_index):
             return (
@@ -1057,7 +1096,9 @@ class UnifiCamBase(metaclass=ABCMeta):
         # Pre-input (decode) slot: hardware-decode HEVC on the iGPU via QSV so
         # frames stay on the GPU for vpp_qsv + h264_qsv (no CPU round-trip).
         prefix = ""
-        if self._hw_transcoding(stream_index):
+        if self._hw_transcoding(stream_index) or self._lo_h265_transcoding(
+            stream_index
+        ):
             # NOTE: do NOT pin `-c:v hevc_qsv` here. The hi source is HEVC, but
             # if this stream ever carries H.264 (e.g. a sub-stream fallback),
             # forcing the HEVC decoder fails with "Function not implemented".
@@ -1077,11 +1118,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             # tags, which Protect ingests but cannot decode; hevc_flv
             # rewrites them into UniFi's codec-id-8 framing (see module).
             hevc_filter = ""
-            if (
-                stream_index in ("", "video1")
-                and getattr(self.args, "hi_codec", "h264") == "h265"
-                and not self._hw_transcoding(stream_index)
-            ):
+            if self._emits_h265(stream_index):
                 hevc_filter = f"{sys.executable} -m unifi.hevc_flv | "
             cmd = (
                 "ffmpeg -nostdin -loglevel error -y"
