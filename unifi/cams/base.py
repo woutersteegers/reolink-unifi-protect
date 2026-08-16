@@ -103,6 +103,30 @@ class UnifiCamBase(metaclass=ABCMeta):
             default="6M",
             help="Target bitrate for the hardware H.264 encode",
         )
+        # --- House: honest per-channel codec + resolution advertisement ---
+        # Upstream hardcodes every channel as "h264" at 1080p. If the hi stream
+        # actually carries HEVC, Protect is told h264, tries to decode it as
+        # h264, and live view spins forever (the snapshot still works because
+        # ffmpeg renders that separately). Declaring the truth per channel lets
+        # the hi stream be H.265 passthrough while the low streams stay H.264 —
+        # no transcoding anywhere. Runtime flags so this is tunable without a
+        # rebuild.
+        parser.add_argument(
+            "--hi-codec",
+            default="h264",
+            choices=["h264", "h265"],
+            help="Codec ACTUALLY carried by the high-quality stream (video1)",
+        )
+        parser.add_argument("--hi-width", default=1920, type=int)
+        parser.add_argument("--hi-height", default=1080, type=int)
+        parser.add_argument(
+            "--lo-codec",
+            default="h264",
+            choices=["h264", "h265"],
+            help="Codec actually carried by the medium/low streams (video2/3)",
+        )
+        parser.add_argument("--lo-width", default=1280, type=int)
+        parser.add_argument("--lo-height", default=720, type=int)
 
     async def _run(self, ws) -> None:
         self._session = ws
@@ -505,7 +529,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 15,
                         "gopModel": 0,
-                        "height": 776,
+                        "height": self.args.hi_height,
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -516,7 +540,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "sourceId": 0,
                         "streamId": 1,
                         "streamOrdinal": 0,
-                        "type": "h264",
+                        "type": self.args.hi_codec,
                         "validBitrateRangeMax": 16000000,
                         "validBitrateRangeMin": 32000,
                         "validFpsValues": [
@@ -539,7 +563,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": 2560,
+                        "width": self.args.hi_width,
                     },
                     "video2": {
                         "M": 1,
@@ -565,7 +589,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 15,
                         "gopModel": 0,
-                        "height": 720,
+                        "height": self.args.lo_height,
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -599,7 +623,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": 1280,
+                        "width": self.args.lo_width,
                     },
                     "video3": {
                         "M": 1,
@@ -625,7 +649,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": 15,
                         "gopModel": 0,
-                        "height": 360,
+                        "height": self.args.lo_height,
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -659,7 +683,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": 640,
+                        "width": self.args.lo_width,
                     },
                     "vinFps": 30,
                 },
