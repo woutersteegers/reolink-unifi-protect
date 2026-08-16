@@ -283,7 +283,9 @@ class UnifiCamBase(metaclass=ABCMeta):
 
     # API for subclasses
     async def trigger_motion_start(
-        self, object_type: Optional[SmartDetectObjectType] = None
+        self,
+        object_type: Optional[SmartDetectObjectType] = None,
+        descriptors: Optional[list] = None,
     ) -> None:
         if not self._motion_event_ts:
             payload: dict[str, Any] = {
@@ -301,9 +303,20 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "motionSnapshot": "",
             }
             if object_type:
+                if descriptors is None:
+                    # Synthetic centered box in Protect's 0-1000
+                    # [x, y, w, h] space (measured from real cameras'
+                    # smartDetectRaws) for callers with no coordinates.
+                    descriptors = [
+                        self.build_smart_descriptor(
+                            object_type.value, [250, 250, 500, 500], 0.9, 0
+                        )
+                    ]
                 payload.update(
                     {
-                        "objectTypes": [object_type.value],
+                        "objectTypes": sorted(
+                            {d["objectType"] for d in descriptors}
+                        ),
                         "edgeType": "enter",
                         # zonesStatusesSchema: record of OBJECTS with a
                         # status label — a bare number fails the whole
@@ -319,21 +332,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         # with smartDetectTypes [] — shown as generic
                         # motion.
                         "displayTimeoutMSec": 5000,
-                        "descriptors": [
-                            {
-                                "trackerID": self._motion_event_id + 1,
-                                "name": object_type.value,
-                                "confidenceLevel": 90,
-                                "coord": [300, 300, 700, 700],
-                                "objectType": object_type.value,
-                                "zones": [1],
-                                "lines": [],
-                                "loiterZones": [],
-                                "stationary": False,
-                                "attributes": {},
-                                "coord3d": [],
-                            }
-                        ],
+                        "descriptors": descriptors,
                     }
                 )
 
@@ -360,6 +359,50 @@ class UnifiCamBase(metaclass=ABCMeta):
                 self._motion_snapshot = Path(motion_snapshot_path)
             except FileNotFoundError:
                 pass
+
+    def build_smart_descriptor(
+        self, object_type: str, coord: list, confidence: float, index: int
+    ) -> dict[str, Any]:
+        # Shape per Protect 7.x's smartDetectObjectsTransformMessage
+        # schema; coord is 0-1000 [x, y, w, h].
+        return {
+            "trackerID": (self._motion_event_id + 1) * 100 + index,
+            "name": object_type,
+            "confidenceLevel": int(round(confidence * 100)),
+            "coord": [int(c) for c in coord],
+            "objectType": object_type,
+            "zones": [1],
+            "lines": [],
+            "loiterZones": [],
+            "stationary": False,
+            "attributes": {},
+            "coord3d": [],
+        }
+
+    async def trigger_motion_update(self, descriptors: list) -> None:
+        """Stream a `moving` track update for an ongoing smart event.
+
+        Real cameras send these continuously so the detection box
+        follows the subject; Protect merges them into the open event.
+        """
+        if not self._motion_event_ts or not descriptors:
+            return
+        payload: dict[str, Any] = {
+            "clockBestMonotonic": 0,
+            "clockBestWall": 0,
+            "clockMonotonic": int(self.get_uptime()),
+            "clockStream": int(self.get_uptime()),
+            "clockStreamRate": 1000,
+            "clockWall": int(round(time.time() * 1000)),
+            "edgeType": "moving",
+            "eventId": self._motion_event_id,
+            "eventType": "motion",
+            "objectTypes": sorted({d["objectType"] for d in descriptors}),
+            "zonesStatus": {"1": {"status": "moving"}},
+            "displayTimeoutMSec": 5000,
+            "descriptors": descriptors,
+        }
+        await self.send(self.gen_response("EventSmartDetect", payload=payload))
 
     async def trigger_motion_stop(self) -> None:
         motion_start_ts = self._motion_event_ts

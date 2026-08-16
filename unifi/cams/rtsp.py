@@ -3,6 +3,7 @@ import asyncio
 import logging
 import subprocess
 import tempfile
+import time
 from pathlib import Path
 from typing import Optional
 
@@ -13,6 +14,8 @@ from unifi.cams.base import SmartDetectObjectType, UnifiCamBase
 
 
 class RTSPCam(UnifiCamBase):
+    AI_CLEAR_AFTER_SEC = 2.5
+
     def __init__(self, args: argparse.Namespace, logger: logging.Logger) -> None:
         super().__init__(args, logger)
         self.args = args
@@ -20,6 +23,9 @@ class RTSPCam(UnifiCamBase):
         self.snapshot_dir = tempfile.mkdtemp()
         self.snapshot_stream = None
         self.runner = None
+        self.sink_runner = None
+        self._sink_last_ts = 0.0
+        self._sink_last_boxes_ts = 0.0
         self.stream_source = dict()
         for i, stream_index in enumerate(["video1", "video2", "video3"]):
             if not i < len(self.args.source):
@@ -69,6 +75,16 @@ class RTSPCam(UnifiCamBase):
             type=float,
             help="Seconds between GetAiState polls",
         )
+        # Receives real detection BOXES from the nodelink-js sidecar
+        # (deploy/ai-sidecar), which decodes the camera's own AI
+        # rectangles off the Baichuan protocol. When box reports are
+        # fresh, the coarse GetAiState poller stands down.
+        parser.add_argument(
+            "--ai-sink-port",
+            default=0,
+            type=int,
+            help="Port to receive AI box reports from the sidecar",
+        )
 
     def start_snapshot_stream(self) -> None:
         if not self.snapshot_stream or self.snapshot_stream.poll() is not None:
@@ -117,8 +133,62 @@ class RTSPCam(UnifiCamBase):
             site = web.TCPSite(self.runner, port=self.args.http_api)
             await site.start()
 
+        if self.args.ai_sink_port:
+            self.logger.info(f"AI box sink listening on {self.args.ai_sink_port}")
+            sink = web.Application()
+            sink.add_routes([web.post("/detections", self._handle_detections)])
+            self.sink_runner = web.AppRunner(sink)
+            await self.sink_runner.setup()
+            await web.TCPSite(self.sink_runner, port=self.args.ai_sink_port).start()
+
         if self.args.reolink_ai_host:
             await self._poll_reolink_ai()
+
+    async def _handle_detections(self, request) -> web.Response:
+        try:
+            data = await request.json()
+        except Exception:
+            return web.Response(status=400, text="bad json")
+        try:
+            await self._on_ai_boxes(data.get("boxes") or [])
+        except Exception:
+            self.logger.exception("Failed to process AI box report")
+        return web.Response(text="ok")
+
+    async def _on_ai_boxes(self, boxes: list) -> None:
+        self._sink_last_ts = time.time()
+        priority = ["person", "vehicle", "animal"]
+        descriptors = []
+        for i, box in enumerate(boxes):
+            kind = box.get("type")
+            coord = box.get("coord")
+            if kind not in priority or not coord or len(coord) != 4:
+                continue
+            descriptors.append(
+                self.build_smart_descriptor(
+                    kind, coord, float(box.get("confidence") or 0.8), i
+                )
+            )
+        if descriptors:
+            self._sink_last_boxes_ts = time.time()
+            if not self._motion_event_ts:
+                present = {d["objectType"] for d in descriptors}
+                lead = next(t for t in priority if t in present)
+                self.logger.info(
+                    f"AI boxes: {sorted(present)} — starting smart event"
+                )
+                await self.trigger_motion_start(
+                    SmartDetectObjectType(lead), descriptors=descriptors
+                )
+            else:
+                await self.trigger_motion_update(descriptors)
+        elif (
+            self._motion_event_ts
+            and time.time() - getattr(self, "_sink_last_boxes_ts", 0)
+            > self.AI_CLEAR_AFTER_SEC
+        ):
+            self.logger.info("AI boxes clear — ending smart event")
+            await self.trigger_motion_stop()
 
     async def _poll_reolink_ai(self) -> None:
         url = (
@@ -140,6 +210,11 @@ class RTSPCam(UnifiCamBase):
         active: Optional[SmartDetectObjectType] = None
         async with aiohttp.ClientSession() as session:
             while True:
+                # The box sidecar is authoritative while it's alive; the
+                # coarse poller only acts as fallback.
+                if time.time() - self._sink_last_ts < 10:
+                    await asyncio.sleep(self.args.reolink_ai_interval)
+                    continue
                 try:
                     async with session.get(
                         url, ssl=False, timeout=aiohttp.ClientTimeout(total=5)
@@ -170,6 +245,8 @@ class RTSPCam(UnifiCamBase):
         await super().close()
         if self.runner:
             await self.runner.cleanup()
+        if self.sink_runner:
+            await self.sink_runner.cleanup()
 
         if self.snapshot_stream:
             self.snapshot_stream.kill()

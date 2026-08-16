@@ -1,0 +1,8 @@
+{
+  "name": "reolink-ai-sidecar",
+  "private": true,
+  "type": "module",
+  "dependencies": {
+    "@apocaliss92/nodelink-js": "^0.6.10"
+  }
+}
