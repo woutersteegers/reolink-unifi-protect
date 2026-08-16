@@ -57,10 +57,13 @@ services:
       - "0xa598"
       - --platform
       - "sav837gw"
+      # Claim the current release (what the real cameras run) so Protect
+      # doesn't offer/push an upgrade to a camera that can't take one
+      # (auto-update is scheduled for 03:00 on this NVR).
       - --fw-version
-      - "5.3.95"
+      - "5.4.122"
       - --fw-build
-      - "148b9a3.260612.645"
+      - "92ebf37.260724.1639"
       - rtsp
       - -s
       - "rtsp://${CAM_USER}:${CAM_PASS}@${CAM_IP}:554/h264Preview_01_main"
