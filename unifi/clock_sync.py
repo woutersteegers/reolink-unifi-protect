@@ -33,14 +33,22 @@ def write_log(data):
 
 
 def write_timestamp_trailer(is_packet, ts):
-    # Write 15 byte trailer
+    # 16-byte inter-tag trailer: one zero byte, a 3-byte clock rate
+    # (90000 for video tags, 11025 for everything else), 8 padding bytes,
+    # then elapsed wall-clock in TICKS OF THAT CLOCK. The old fixed
+    # ts*100000 made Protect's ms derive audio wall-clocks running 9x
+    # fast and video 1.11x fast; once the drift crossed its 1000 ms
+    # threshold it dropped frames (InNetLiveFLVStream::FeedData FAILED),
+    # starving live view and the recorder.
     write(make_ui8(0))
     if is_packet:
+        clock = 90000
         write(bytes([1, 95, 144, 0, 0, 0, 0, 0, 0, 0, 0]))
     else:
+        clock = 11025
         write(bytes([0, 43, 17, 0, 0, 0, 0, 0, 0, 0, 0]))
 
-    write(make_ui32(int(ts * 1000 * 100)))
+    write(make_ui32(int(ts * clock) & 0xFFFFFFFF))
 
 
 def main(args):

@@ -57,6 +57,38 @@ def read_exact(source, count):
     return buf
 
 
+def _hvcc_parameter_sets(record: bytes):
+    """Extract (VPS, SPS, PPS) from an HEVCDecoderConfigurationRecord.
+
+    ISO/IEC 14496-15: 22 fixed bytes, then numOfArrays of
+    [nal_type, count, [len16, NAL]...]. Returns None when incomplete.
+    """
+    if len(record) <= 22:
+        return None
+    found = {}
+    cursor = 22
+    arrays = record[cursor]
+    cursor += 1
+    for _ in range(arrays):
+        if cursor + 3 > len(record):
+            break
+        kind = record[cursor] & 0x3F
+        count = int.from_bytes(record[cursor + 1: cursor + 3], "big")
+        cursor += 3
+        for _ in range(count):
+            if cursor + 2 > len(record):
+                break
+            size = int.from_bytes(record[cursor: cursor + 2], "big")
+            cursor += 2
+            unit = record[cursor: cursor + size]
+            cursor += size
+            if len(unit) == size and kind not in found:
+                found[kind] = unit
+    if all(k in found for k in (32, 33, 34)):  # VPS, SPS, PPS
+        return found[32], found[33], found[34]
+    return None
+
+
 def transform_video(body: bytes):
     """Rewrite an Enhanced-RTMP hvc1 tag body to UniFi framing.
 
@@ -71,10 +103,19 @@ def transform_video(body: bytes):
         return body
     rest = body[5:]
     if packet_type == EX_SEQUENCE_START:
-        # Payload is an hvcC record — exactly what the receiver wants
-        # after UniFi's config header (finch push.config_body).
-        return bytes([(FRAME_SEQUENCE_HEADER << 4) | CODEC_H265,
-                      PACKET_SEQUENCE_HEADER, 0, 0, 0]) + rest
+        # Payload is an hvcC record. Protect's codec sniffer does NOT
+        # read hvcC (it reports codec VUNK): a real camera's config tag
+        # is byte0=0x68, byte1=1, then bare 2-byte length-prefixed
+        # VPS/SPS/PPS with no composition field (pyunifiwire
+        # hevc.parameter_sets, measured on a real UVC).
+        sets = _hvcc_parameter_sets(rest)
+        if sets is None:
+            return bytes([(FRAME_SEQUENCE_HEADER << 4) | CODEC_H265,
+                          PACKET_SEQUENCE_HEADER, 0, 0, 0]) + rest
+        out = bytearray([(FRAME_SEQUENCE_HEADER << 4) | CODEC_H265, 1])
+        for unit in sets:
+            out += len(unit).to_bytes(2, "big") + unit
+        return bytes(out)
     ft = FRAME_KEY if frame_type == 1 else FRAME_INTER
     if packet_type == EX_CODED_FRAMES:
         # 3-byte composition time, then 4-byte length-prefixed NALs.
