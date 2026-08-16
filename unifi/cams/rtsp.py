@@ -256,6 +256,16 @@ class RTSPCam(UnifiCamBase):
 
     async def _on_ai_boxes(self, boxes: list) -> None:
         self._sink_last_ts = time.time()
+        # Raw view of everything the camera reports, before any filter —
+        # the ground truth when diagnosing missed/misclassified subjects.
+        if boxes and time.time() - getattr(self, "_ai_raw_log_ts", 0) > 1.0:
+            self._ai_raw_log_ts = time.time()
+            raw = ", ".join(
+                f"{b.get('type')}@{int((b.get('confidence') or 0) * 100)}%"
+                f"{b.get('coord')}"
+                for b in boxes
+            )
+            self.logger.info(f"AI raw: {raw}")
         boxes = self._filter_stationary(boxes)
         priority = [c.strip() for c in self.args.ai_classes.split(",") if c.strip()]
         descriptors = []
