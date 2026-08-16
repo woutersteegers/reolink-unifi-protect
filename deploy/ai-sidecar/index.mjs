@@ -3,6 +3,7 @@
 // overlays) and forwards them to the unifi-cam-proxy sink as a steady
 // heartbeat, mapped to Protect's 0-1000 [x, y, w, h] space.
 import { ReolinkBaichuanApi } from "@apocaliss92/nodelink-js";
+import { decodeCopies } from "./decode.mjs";
 
 const HOST = process.env.CAM_IP;
 const USER = process.env.CAM_USER || "admin";
@@ -32,7 +33,62 @@ const REMAP = Object.fromEntries(
 
 let latest = [];
 
+// Ambiguity tie-break when several class copies share the top
+// confidence: prefer person (matches what the official app displays for
+// a walking human, which populates every wrapper on this firmware).
+const TIE_ORDER = { people: 3, animal: 2, vehicle: 1, unknown: 0 };
+let lastCopyLog = 0;
+
 function mapEvent(event) {
+  const { copies, frameWidth, frameHeight } = decodeCopies(event.rawHeader);
+  if (copies.length === 0) return mapNodelinkBoxes(event);
+
+  // Group the per-class wrapper copies of each physical box and pick
+  // the label by highest per-copy confidence.
+  const groups = new Map();
+  for (const c of copies) {
+    if (c.x2 > frameWidth || c.y2 > frameHeight || c.x2 <= c.x1 || c.y2 <= c.y1)
+      continue;
+    const key = `${c.x1}_${c.y1}_${c.x2}_${c.y2}`;
+    (groups.get(key) ?? groups.set(key, []).get(key)).push(c);
+  }
+
+  if (Date.now() - lastCopyLog > 1000 && groups.size) {
+    lastCopyLog = Date.now();
+    for (const [key, g] of groups) {
+      const detail = g
+        .map((c) => `${c.label}@${c.conf}(len${c.len}${c.extras ? ",x=" + c.extras : ""})`)
+        .join(" ");
+      console.log(`copies [${key}]: ${detail}`);
+    }
+  }
+
+  const boxes = [];
+  for (const g of groups.values()) {
+    g.sort(
+      (a, b) =>
+        b.conf - a.conf || (TIE_ORDER[b.label] ?? 0) - (TIE_ORDER[a.label] ?? 0),
+    );
+    const best = g[0];
+    let type = LABELS[best.label];
+    if (!type) continue;
+    type = REMAP[type] || type;
+    boxes.push({
+      type,
+      confidence: Math.min(best.conf, 100) / 100,
+      coord: [
+        Math.round((best.x1 / frameWidth) * 1000),
+        Math.round((best.y1 / frameHeight) * 1000),
+        Math.round(((best.x2 - best.x1) / frameWidth) * 1000),
+        Math.round(((best.y2 - best.y1) / frameHeight) * 1000),
+      ],
+    });
+  }
+  return boxes;
+}
+
+// Fallback: nodelink's own (deduped) boxes, if our decoder finds nothing.
+function mapNodelinkBoxes(event) {
   const boxes = [];
   for (const b of event.boxes) {
     let type = LABELS[(b.label || "").toLowerCase()];
