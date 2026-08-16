@@ -91,7 +91,7 @@ services:
       # that used to arrive as person) — 0.8 passes actual dogs while
       # still burying the flicker.
       - --ai-confidence-overrides
-      - "animal=0.8"
+      - "animal=0.6"
       # Audio passthrough (AAC-LC 16k mono, the real UniFi wire format).
       # Timestamps come from the camera's RTP clock (wallclock stamping
       # removed in base.py) so the samples line up gaplessly.
