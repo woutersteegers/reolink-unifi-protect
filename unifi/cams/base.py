@@ -305,7 +305,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                     {
                         "objectTypes": [object_type.value],
                         "edgeType": "enter",
-                        "zonesStatus": {"1": 48},
+                        # zonesStatusesSchema: record of OBJECTS with a
+                        # status label — a bare number fails the whole
+                        # AJV message.
+                        "zonesStatus": {"1": {"status": "enter"}},
                         "smartDetectSnapshot": "",
                         # Protect 7.x validates this against its
                         # smartDetectObjectsTransformMessage schema and
@@ -381,7 +384,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     {
                         "objectTypes": [motion_object_type.value],
                         "edgeType": "leave",
-                        "zonesStatus": {"1": 48},
+                        "zonesStatus": {"1": {"status": "leave"}},
                         "smartDetectSnapshot": "motionsnap.jpg",
                         "displayTimeoutMSec": 5000,
                         "descriptors": [],
