@@ -305,8 +305,32 @@ class UnifiCamBase(metaclass=ABCMeta):
                     {
                         "objectTypes": [object_type.value],
                         "edgeType": "enter",
-                        "zonesStatus": {"0": 48},
+                        "zonesStatus": {"1": 48},
                         "smartDetectSnapshot": "",
+                        # Protect 7.x validates this against its
+                        # smartDetectObjectsTransformMessage schema and
+                        # derives the event's smartDetectTypes ONLY from
+                        # non-stationary track descriptors; without them
+                        # (or without displayTimeoutMSec, which is
+                        # required) validation fails and the event saves
+                        # with smartDetectTypes [] — shown as generic
+                        # motion.
+                        "displayTimeoutMSec": 5000,
+                        "descriptors": [
+                            {
+                                "trackerID": self._motion_event_id + 1,
+                                "name": object_type.value,
+                                "confidenceLevel": 90,
+                                "coord": [300, 300, 700, 700],
+                                "objectType": object_type.value,
+                                "zones": [1],
+                                "lines": [],
+                                "loiterZones": [],
+                                "stationary": False,
+                                "attributes": {},
+                                "coord3d": [],
+                            }
+                        ],
                     }
                 )
 
@@ -357,8 +381,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                     {
                         "objectTypes": [motion_object_type.value],
                         "edgeType": "leave",
-                        "zonesStatus": {"0": 48},
+                        "zonesStatus": {"1": 48},
                         "smartDetectSnapshot": "motionsnap.jpg",
+                        "displayTimeoutMSec": 5000,
+                        "descriptors": [],
                     }
                 )
             self.logger.info(
@@ -1082,6 +1108,16 @@ class UnifiCamBase(metaclass=ABCMeta):
             res = self.gen_response(
                 "ChangeSmartDetectSettings", response_to=m["messageId"]
             )
+        elif fn == "ChangeSmartMotionSettings":
+            # Unanswered, these time out on Protect 7.x and it marks the
+            # camera's smart detection unhealthy.
+            res = self.gen_response(
+                "ChangeSmartMotionSettings", response_to=m["messageId"]
+            )
+        elif fn == "SmartMotionTest":
+            res = self.gen_response("SmartMotionTest", response_to=m["messageId"])
+        elif fn == "UpdateFaceDBRequest":
+            res = self.gen_response("UpdateFaceDBRequest", response_to=m["messageId"])
         elif fn == "UpdateFirmwareRequest":
             await self.process_upgrade(m)
             return True
