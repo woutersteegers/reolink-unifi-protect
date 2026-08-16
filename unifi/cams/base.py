@@ -254,7 +254,13 @@ class UnifiCamBase(metaclass=ABCMeta):
             "motionDetect": ["enhanced"],
             # Classes the Reolink's own on-camera AI can emit; also what
             # Protect needs to see for AI Port pairing to make sense.
+            # Key spelling on the wire is uncertain (videoCodecs needed
+            # the plural form) — send the variants; unknown keys are
+            # ignored.
             "smartDetect": ["person", "vehicle", "animal"],
+            "smartDetectTypes": ["person", "vehicle", "animal"],
+            "smartDetectAudioTypes": [],
+            "hasSmartDetect": True,
             "videoCodecs": codecs,
             "audioCodecs": ["aac"],
             "audioStyle": ["nature"],
