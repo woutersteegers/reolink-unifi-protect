@@ -1154,21 +1154,21 @@ class UnifiCamBase(metaclass=ABCMeta):
             res = self.gen_response(
                 "ChangeSmartDetectSettings", response_to=m["messageId"]
             )
-        elif fn == "ChangeSmartMotionSettings":
-            # Unanswered, these time out on Protect 7.x and it marks the
-            # camera's smart detection unhealthy.
-            res = self.gen_response(
-                "ChangeSmartMotionSettings", response_to=m["messageId"]
-            )
-        elif fn == "SmartMotionTest":
-            res = self.gen_response("SmartMotionTest", response_to=m["messageId"])
-        elif fn == "UpdateFaceDBRequest":
-            res = self.gen_response("UpdateFaceDBRequest", response_to=m["messageId"])
         elif fn == "UpdateFirmwareRequest":
             await self.process_upgrade(m)
             return True
         elif fn == "Reboot":
             return True
+
+        if res is None and m.get("responseExpected"):
+            # Protect 7.x sends many settings requests (talkback, clarity
+            # zones, audio events, smart motion, face DB, ...) and stalls
+            # 5 s on each unanswered one — including at viewer join.
+            # Acknowledge anything we don't specifically handle by
+            # echoing its payload, exactly like the specific handlers do.
+            res = self.gen_response(
+                fn, response_to=m["messageId"], payload=m.get("payload") or {}
+            )
 
         if res is not None:
             await self.send(res)
