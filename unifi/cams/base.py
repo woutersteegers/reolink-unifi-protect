@@ -224,7 +224,15 @@ class UnifiCamBase(metaclass=ABCMeta):
         if self._lo_h265_transcoding(stream_index):
             # Same dimensions in and out — no scaler, decode straight
             # into hevc_qsv on the iGPU.
-            return f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}" " -c:a copy"
+            # -g = 1s keyframe cadence: hevc_qsv's default GOP is many
+            # seconds long, which forced Protect's thumbnailer to decode
+            # 8+s of video per event thumb (10-25s, queueing) — the app
+            # then falls back to a stale full-frame snapshot.
+            lo_fps = getattr(self.args, "lo_fps", None) or 30
+            return (
+                f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
+                f" -g {lo_fps} -c:a copy"
+            )
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if self._hw_transcoding(stream_index):
             return (
