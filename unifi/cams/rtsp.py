@@ -285,12 +285,33 @@ class RTSPCam(UnifiCamBase):
             coord = box.get("coord")
             if kind not in priority or not coord or len(coord) != 4:
                 continue
+            # Classes the user disabled in Protect's camera settings
+            # (ChangeSmartMotionSettings) are dropped here — the camera
+            # keeps classifying them on the wire regardless of any
+            # Reolink-app toggle.
+            if (
+                self.smart_detect_enabled is not None
+                and kind not in self.smart_detect_enabled
+            ):
+                continue
             confidence = float(box.get("confidence") or 0.8)
             if confidence < self._min_confidence(kind):
                 continue
+            # Honor the zones drawn in Protect: a detection whose box
+            # center sits outside every smart-detect zone (or inside an
+            # exclude zone) never becomes an event.
+            zone_ids = self.smart_zones_containing(
+                kind, coord[0] + coord[2] / 2, coord[1] + coord[3] / 2
+            )
+            if zone_ids is not None and not zone_ids:
+                continue
             descriptors.append(
                 self.build_smart_descriptor(
-                    kind, coord, confidence, box.get("track_id", 9000 + i)
+                    kind,
+                    coord,
+                    confidence,
+                    box.get("track_id", 9000 + i),
+                    zones=zone_ids,
                 )
             )
         if descriptors:
@@ -364,6 +385,11 @@ class RTSPCam(UnifiCamBase):
                     now = time.time()
                     for key, object_type in classes:
                         entry = value.get(key) or {}
+                        if (
+                            self.smart_detect_enabled is not None
+                            and object_type.value not in self.smart_detect_enabled
+                        ):
+                            continue
                         if entry.get("support") and entry.get("alarm_state"):
                             # CLASS AUTHORITY for the box sink: GetAiState
                             # is the same detector state the Reolink app

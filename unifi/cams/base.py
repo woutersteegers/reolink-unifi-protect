@@ -2,6 +2,7 @@ import argparse
 import atexit
 import json
 import logging
+import os
 import re
 import shutil
 import ssl
@@ -39,6 +40,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._init_time: float = time.time()
         self._streams: dict[str, str] = {}
         self._motion_snapshot: Optional[Path] = None
+        # Smart-detect config pushed by Protect (ChangeSmartDetectSettings):
+        # enabled classes, and the zone polygons the user drew in the UI.
+        # None = not told yet, allow everything everywhere.
+        self.smart_detect_enabled: Optional[set] = None
+        self.smart_detect_zones: Optional[dict] = None
+        self.smart_exclude_zones: Optional[dict] = None
         self._motion_event_id: int = 0
         self._motion_event_ts: Optional[float] = None
         self._motion_object_type: Optional[SmartDetectObjectType] = None
@@ -319,7 +326,12 @@ class UnifiCamBase(metaclass=ABCMeta):
                         # zonesStatusesSchema: record of OBJECTS with a
                         # status label — a bare number fails the whole
                         # AJV message.
-                        "zonesStatus": {"1": {"status": "enter"}},
+                        "zonesStatus": {
+                            str(z): {"status": "enter"}
+                            for d in descriptors
+                            for z in d["zones"]
+                        }
+                        or {"1": {"status": "enter"}},
                         "smartDetectSnapshot": "",
                         # Protect 7.x validates this against its
                         # smartDetectObjectsTransformMessage schema and
@@ -364,7 +376,12 @@ class UnifiCamBase(metaclass=ABCMeta):
     SMART_DISPLAY_TIMEOUT_MS = 600
 
     def build_smart_descriptor(
-        self, object_type: str, coord: list, confidence: float, tracker_id: int
+        self,
+        object_type: str,
+        coord: list,
+        confidence: float,
+        tracker_id: int,
+        zones: Optional[list] = None,
     ) -> dict[str, Any]:
         # Shape per Protect 7.x's smartDetectObjectsTransformMessage
         # schema; coord is 0-1000 [x, y, w, h]. tracker_id must be
@@ -376,7 +393,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             "confidenceLevel": int(round(confidence * 100)),
             "coord": [int(c) for c in coord],
             "objectType": object_type,
-            "zones": [1],
+            "zones": [int(z) for z in zones] if zones else [1],
             "lines": [],
             "loiterZones": [],
             "stationary": False,
@@ -403,7 +420,12 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventId": self._motion_event_id,
             "eventType": "motion",
             "objectTypes": sorted({d["objectType"] for d in descriptors}),
-            "zonesStatus": {"1": {"status": "moving"}},
+            "zonesStatus": {
+                str(z): {"status": "moving"}
+                for d in descriptors
+                for z in d["zones"]
+            }
+            or {"1": {"status": "moving"}},
             "displayTimeoutMSec": self.SMART_DISPLAY_TIMEOUT_MS,
             "descriptors": descriptors,
         }
@@ -465,9 +487,15 @@ class UnifiCamBase(metaclass=ABCMeta):
                 if resp.status != 200:
                     self.logger.error(f"Error retrieving file {resp.status}")
                     return False
-                with dst.open("wb") as f:
-                    f.write(await resp.read())
-                    return True
+                body = await resp.read()
+                # Atomic replace: the destination is read concurrently
+                # (motion-snapshot copies, upload handlers); writing it in
+                # place hands them truncated JPEGs that render grey/black.
+                tmp = dst.with_name(dst.name + ".part")
+                with tmp.open("wb") as f:
+                    f.write(body)
+                os.replace(tmp, dst)
+                return True
         except aiohttp.ClientError:
             return False
 
@@ -1039,6 +1067,111 @@ class UnifiCamBase(metaclass=ABCMeta):
             "ChangeAnalyticsSettings", msg["messageId"], msg["payload"]
         )
 
+    async def process_smart_motion_settings(
+        self, msg: AVClientRequest
+    ) -> AVClientResponse:
+        # Protect pushes the per-camera smart-detection config here (on
+        # connect and whenever the user toggles a class in the UI). The
+        # enabled classes live in an objectTypes list; honor them so the
+        # Protect toggles actually control which events we forward.
+        payload = msg.get("payload") or {}
+        types: Optional[set] = None
+        containers = [payload, payload.get("smartDetectSettings") or {}]
+        # Classes may sit per smart-detect zone; the event types are the
+        # union across zones. zones is a dict keyed by zone id here.
+        zones = payload.get("zones")
+        zone_values = (
+            zones.values()
+            if isinstance(zones, dict)
+            else zones if isinstance(zones, list) else []
+        )
+        containers.extend(z for z in zone_values if isinstance(z, dict))
+        for container in containers:
+            if isinstance(container, dict) and isinstance(
+                container.get("objectTypes"), list
+            ):
+                types = (types or set()) | {str(t) for t in container["objectTypes"]}
+        if types is not None:
+            self.smart_detect_enabled = types
+            self.logger.info(
+                f"Protect smart-detect classes: {sorted(self.smart_detect_enabled)}"
+            )
+        if msg["functionName"] == "ChangeSmartDetectSettings":
+            self.smart_detect_zones = self._parse_zone_map(payload.get("zones"))
+            self.smart_exclude_zones = self._parse_zone_map(
+                payload.get("excludeZones")
+            )
+            for label, zmap in (
+                ("zones", self.smart_detect_zones),
+                ("exclude zones", self.smart_exclude_zones),
+            ):
+                for zid, zone in (zmap or {}).items():
+                    self.logger.info(
+                        f"Protect smart-detect {label}[{zid}]:"
+                        f" {len(zone['poly'])} vertices,"
+                        f" classes {sorted(zone['object_types'] or ['any'])}"
+                    )
+        return self.gen_response(msg["functionName"], response_to=msg["messageId"])
+
+    @staticmethod
+    def _parse_zone_map(container: Any) -> dict:
+        """Protect zone map ({id: {coord: [x1,y1,x2,y2,...], ...}}) into
+        {id: {poly: [(x,y)...], object_types: set|None}} in 0-1000 space."""
+        zones: dict = {}
+        if not isinstance(container, dict):
+            return zones
+        for zid, zone in container.items():
+            if not isinstance(zone, dict):
+                continue
+            coord = zone.get("coord") or []
+            if len(coord) < 6 or len(coord) % 2:
+                continue
+            poly = [
+                (float(coord[i]), float(coord[i + 1]))
+                for i in range(0, len(coord), 2)
+            ]
+            types = zone.get("objectTypes")
+            zones[str(zid)] = {
+                "poly": poly,
+                "object_types": {str(t) for t in types} if types else None,
+            }
+        return zones
+
+    @staticmethod
+    def _point_in_poly(x: float, y: float, poly: list) -> bool:
+        inside = False
+        j = len(poly) - 1
+        for i in range(len(poly)):
+            xi, yi = poly[i]
+            xj, yj = poly[j]
+            if (yi > y) != (yj > y) and x < (xj - xi) * (y - yi) / (yj - yi) + xi:
+                inside = not inside
+            j = i
+        return inside
+
+    def smart_zones_containing(
+        self, kind: str, x: float, y: float
+    ) -> Optional[list]:
+        """Zone ids whose polygon contains (x, y) and whose class list
+        allows `kind`. None = no zone config known (filtering off);
+        [] = the point is outside every applicable zone (drop it)."""
+        zones = self.smart_detect_zones
+        if zones is None:
+            return None
+        for zone in (self.smart_exclude_zones or {}).values():
+            if zone["object_types"] is not None and kind not in zone["object_types"]:
+                continue
+            if self._point_in_poly(x, y, zone["poly"]):
+                return []
+        if not zones:
+            return None
+        return [
+            zid
+            for zid, zone in zones.items()
+            if (zone["object_types"] is None or kind in zone["object_types"])
+            and self._point_in_poly(x, y, zone["poly"])
+        ]
+
     async def process_snapshot_request(
         self, msg: AVClientRequest
     ) -> Optional[AVClientResponse]:
@@ -1058,7 +1191,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                         data=files,
                         ssl=self._ssl_context,
                     )
-                    self.logger.debug(f"Uploaded {snapshot_type} from {path}")
+                    self.logger.info(
+                        f"Uploaded {snapshot_type}"
+                        f" ({path.stat().st_size} bytes) from {path}"
+                    )
                 except aiohttp.ClientError:
                     self.logger.exception("Failed to upload snapshot")
         else:
@@ -1155,10 +1291,8 @@ class UnifiCamBase(metaclass=ABCMeta):
             res = self.gen_response(
                 "UpdateUsernamePassword", response_to=m["messageId"]
             )
-        elif fn == "ChangeSmartDetectSettings":
-            res = self.gen_response(
-                "ChangeSmartDetectSettings", response_to=m["messageId"]
-            )
+        elif fn in ("ChangeSmartDetectSettings", "ChangeSmartMotionSettings"):
+            res = await self.process_smart_motion_settings(m)
         elif fn == "UpdateFirmwareRequest":
             await self.process_upgrade(m)
             return True
