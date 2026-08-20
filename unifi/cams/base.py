@@ -301,8 +301,13 @@ class UnifiCamBase(metaclass=ABCMeta):
     ) -> None:
         if not self._motion_event_ts:
             payload: dict[str, Any] = {
-                "clockBestMonotonic": 0,
-                "clockBestWall": 0,
+                # Real wall/monotonic clocks: Protect timestamps each
+                # descriptor sample off clockBestWall when persisting
+                # smartDetectTracks — zeros make every sample land at
+                # epoch 0, the track is discarded, and the event
+                # thumbnail cropper has no box to zoom to.
+                "clockBestMonotonic": int(self.get_uptime()),
+                "clockBestWall": int(round(time.time() * 1000)),
                 "clockMonotonic": int(self.get_uptime()),
                 "clockStream": int(self.get_uptime()),
                 "clockStreamRate": 1000,
@@ -418,8 +423,8 @@ class UnifiCamBase(metaclass=ABCMeta):
         if not self._motion_event_ts or not descriptors:
             return
         payload: dict[str, Any] = {
-            "clockBestMonotonic": 0,
-            "clockBestWall": 0,
+            "clockBestMonotonic": int(self.get_uptime()),
+            "clockBestWall": int(round(time.time() * 1000)),
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
