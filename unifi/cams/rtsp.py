@@ -323,6 +323,7 @@ class RTSPCam(UnifiCamBase):
             )
             if not self._motion_event_ts:
                 self.logger.info(f"AI boxes: {detail} — starting smart event")
+                self._ai_crops_made = set()
                 await self.trigger_motion_start(
                     SmartDetectObjectType(lead), descriptors=descriptors
                 )
@@ -339,13 +340,30 @@ class RTSPCam(UnifiCamBase):
                     f"AI class upgrade {self._ai_active_lead} -> {lead}"
                     f" ({detail}) — retyping event"
                 )
+                saved_crops = list(self._smart_snapshots)
                 await self.trigger_motion_stop()
                 await self.trigger_motion_start(
                     SmartDetectObjectType(lead), descriptors=descriptors
                 )
+                # Carry the crops over to the retyped event.
+                self._smart_snapshots = saved_crops
                 self._ai_active_lead = lead
             else:
                 await self.trigger_motion_update(descriptors)
+            # One square crop per tracked object, generated from a fresh
+            # camera snapshot around its current box — the source of the
+            # zoomed event thumbnail Protect shows (see base.py notes).
+            made = getattr(self, "_ai_crops_made", None)
+            if made is None:
+                made = self._ai_crops_made = set()
+            for d in descriptors:
+                if d["trackerID"] not in made:
+                    made.add(d["trackerID"])
+                    asyncio.create_task(
+                        self._make_object_crop(
+                            d["trackerID"], d["objectType"], d["coord"]
+                        )
+                    )
         elif (
             self._motion_event_ts
             and time.time() - getattr(self, "_sink_last_boxes_ts", 0)
@@ -354,6 +372,75 @@ class RTSPCam(UnifiCamBase):
             self.logger.info("AI boxes clear — ending smart event")
             await self.trigger_motion_stop()
             self._ai_active_lead = None
+
+    async def _make_object_crop(self, tracker_id: int, kind: str, coord: list) -> None:
+        """Square crop around one detection, from a fresh camera snapshot.
+
+        Announced via smartDetectSnapshots at event stop; Protect fetches
+        it by filename and shows it as the event's zoomed thumbnail. The
+        crop is square (Protect's isRealCropped requires it) and padded
+        around the box so the subject has context.
+        """
+        try:
+            src = Path(self.snapshot_dir, f"crop_src_{tracker_id}.jpg")
+            if self.args.snapshot_url:
+                if not await self.fetch_to_file(self.args.snapshot_url, src):
+                    return
+            else:
+                snap = await self.get_snapshot()
+                if not snap.exists():
+                    return
+                src = snap
+            ts_ms = int(round(time.time() * 1000))
+
+            fw = int(getattr(self.args, "hi_width", 0) or 1920)
+            fh = int(getattr(self.args, "hi_height", 0) or 1080)
+            x, y, w, h = (float(c) for c in coord)
+            box_w, box_h = w * fw / 1000, h * fh / 1000
+            cx, cy = (x + w / 2) * fw / 1000, (y + h / 2) * fh / 1000
+            side = int(max(320, min(fh, max(box_w, box_h) * 2.2)))
+            left = int(min(max(cx - side / 2, 0), fw - side))
+            top = int(min(max(cy - side / 2, 0), fh - side))
+
+            fname = f"detect_{tracker_id}.jpg"
+            out = Path(self.snapshot_dir, fname)
+            proc = await asyncio.create_subprocess_exec(
+                "ffmpeg",
+                "-y",
+                "-loglevel",
+                "error",
+                "-i",
+                str(src),
+                "-vf",
+                f"crop={side}:{side}:{left}:{top}",
+                str(out),
+                stdout=asyncio.subprocess.DEVNULL,
+                stderr=asyncio.subprocess.DEVNULL,
+            )
+            await asyncio.wait_for(proc.wait(), timeout=15)
+            if proc.returncode != 0 or not out.exists():
+                self.logger.warning(f"Object crop failed for tracker {tracker_id}")
+                return
+            self._smart_snapshot_files[fname] = out
+            if not self._motion_event_ts:
+                # Event already ended; the stop payload went out without
+                # this crop and appending now would pollute the next one.
+                return
+            self._smart_snapshots.append(
+                {
+                    "trackerID": int(tracker_id),
+                    "clockBestWall": ts_ms,
+                    "smartDetectSnapshot": fname,
+                    "smartDetectSnapshotType": kind,
+                    "smartDetectSnapshotName": fname,
+                }
+            )
+            self.logger.info(
+                f"Object crop ready: {kind}#{tracker_id}"
+                f" {side}x{side}@{left},{top} -> {fname}"
+            )
+        except Exception:
+            self.logger.exception("Failed to build object crop")
 
     async def _poll_reolink_ai(self) -> None:
         url = (

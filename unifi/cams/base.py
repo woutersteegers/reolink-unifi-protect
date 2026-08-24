@@ -40,6 +40,14 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._init_time: float = time.time()
         self._streams: dict[str, str] = {}
         self._motion_snapshot: Optional[Path] = None
+        # Per-object cropped snapshots for the current smart event.
+        # Announced in the stop payload's smartDetectSnapshots; Protect
+        # then fetches each by filename (GetRequest) and uses the square
+        # image as the event's zoomed thumbnail (isRealCropped needs
+        # width == height). Without these Protect center-crops the full
+        # frame, which on a panorama shows nothing useful.
+        self._smart_snapshots: list = []
+        self._smart_snapshot_files: dict[str, Path] = {}
         # Smart-detect config pushed by Protect (ChangeSmartDetectSettings):
         # enabled classes, and the zone polygons the user drew in the UI.
         # None = not told yet, allow everything everywhere.
@@ -473,6 +481,21 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "descriptors": [],
                     }
                 )
+                if self._smart_snapshots:
+                    payload["smartDetectSnapshots"] = list(self._smart_snapshots)
+                    payload["trackerIDAttrMap"] = {
+                        str(entry["trackerID"]): {}
+                        for entry in self._smart_snapshots
+                    }
+                    self.logger.info(
+                        "Announcing object crops: "
+                        + ", ".join(
+                            f"{e['smartDetectSnapshotType']}"
+                            f"#{e['trackerID']}:{e['smartDetectSnapshot']}"
+                            for e in self._smart_snapshots
+                        )
+                    )
+                self._smart_snapshots = []
             self.logger.info(
                 f"Triggering motion stop (idx: {self._motion_event_id})"
                 + f" for {motion_object_type.value}"
@@ -1189,7 +1212,11 @@ class UnifiCamBase(metaclass=ABCMeta):
         self, msg: AVClientRequest
     ) -> Optional[AVClientResponse]:
         snapshot_type = msg["payload"]["what"]
-        if snapshot_type in ["motionSnapshot", "smartDetectZoneSnapshot"]:
+        filename = msg["payload"].get("filename")
+        if filename and filename in self._smart_snapshot_files:
+            # Per-object crop announced in smartDetectSnapshots.
+            path = self._smart_snapshot_files[filename]
+        elif snapshot_type in ["motionSnapshot", "smartDetectZoneSnapshot"]:
             path = self._motion_snapshot
         else:
             path = await self.get_snapshot()
