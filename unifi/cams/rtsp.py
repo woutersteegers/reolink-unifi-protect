@@ -381,11 +381,12 @@ class RTSPCam(UnifiCamBase):
         crop is square (Protect's isRealCropped requires it) and padded
         around the box so the subject has context.
         """
+        fetched = Path(self.snapshot_dir, f"crop_src_{tracker_id}.jpg")
         try:
-            src = Path(self.snapshot_dir, f"crop_src_{tracker_id}.jpg")
             if self.args.snapshot_url:
-                if not await self.fetch_to_file(self.args.snapshot_url, src):
+                if not await self.fetch_to_file(self.args.snapshot_url, fetched):
                     return
+                src = fetched
             else:
                 snap = await self.get_snapshot()
                 if not snap.exists():
@@ -422,6 +423,7 @@ class RTSPCam(UnifiCamBase):
                 self.logger.warning(f"Object crop failed for tracker {tracker_id}")
                 return
             self._smart_snapshot_files[fname] = out
+            self.prune_stale_crops()
             if not self._motion_event_ts:
                 # Event already ended; the stop payload went out without
                 # this crop and appending now would pollute the next one.
@@ -441,6 +443,11 @@ class RTSPCam(UnifiCamBase):
             )
         except Exception:
             self.logger.exception("Failed to build object crop")
+        finally:
+            # The fetched full frame is only an ffmpeg input; the crop is
+            # what Protect asks for. Never touches screen.jpg, which the
+            # snapshot-stream path uses as its source instead.
+            fetched.unlink(missing_ok=True)
 
     async def _poll_reolink_ai(self) -> None:
         url = (
@@ -514,6 +521,12 @@ class RTSPCam(UnifiCamBase):
 
         if self.snapshot_stream:
             self.snapshot_stream.kill()
+
+        # Empty (not remove) the scratch dir: Core reuses this instance
+        # across websocket reconnects and run() writes here again.
+        for path in Path(self.snapshot_dir).iterdir():
+            if path.is_file():
+                path.unlink(missing_ok=True)
 
     async def get_stream_source(self, stream_index: str) -> str:
         return self.stream_source[stream_index]

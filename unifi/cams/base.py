@@ -1,10 +1,12 @@
 import argparse
+import asyncio
 import atexit
 import json
 import logging
 import os
 import re
 import shutil
+import signal
 import ssl
 import subprocess
 import sys
@@ -40,6 +42,10 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._init_time: float = time.time()
         self._streams: dict[str, str] = {}
         self._motion_snapshot: Optional[Path] = None
+        # The one scratch file motion snapshots are written to. Reused
+        # across events: one leaked ~2MB JPEG per event filled the host's
+        # docker.img in a few days.
+        self._motion_snapshot_file: Optional[Path] = None
         # Per-object cropped snapshots for the current smart event.
         # Announced in the stop payload's smartDetectSnapshots; Protect
         # then fetches each by filename (GetRequest) and uses the square
@@ -58,6 +64,10 @@ class UnifiCamBase(metaclass=ABCMeta):
         self._motion_event_ts: Optional[float] = None
         self._motion_object_type: Optional[SmartDetectObjectType] = None
         self._ffmpeg_handles: dict[str, subprocess.Popen] = {}
+        # stream_index -> (stream_name, (host, port)); lets the
+        # watchdog respawn a stream Protect isn't actively cycling.
+        self._stream_meta: dict[str, tuple[str, tuple[str, int]]] = {}
+        self._watchdog_task: Optional[asyncio.Task] = None
 
         # Set up ssl context for requests
         self._ssl_context = ssl.create_default_context()
@@ -165,6 +175,8 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def _run(self, ws) -> None:
         self._session = ws
         await self.init_adoption()
+        if self._watchdog_task is None or self._watchdog_task.done():
+            self._watchdog_task = asyncio.create_task(self._watch_streams())
         while True:
             try:
                 msg = await ws.recv()
@@ -382,14 +394,19 @@ class UnifiCamBase(metaclass=ABCMeta):
             self._motion_event_ts = time.time()
             self._motion_object_type = object_type
 
-            # Capture snapshot at beginning of motion event for thumbnail
-            motion_snapshot_path: str = tempfile.NamedTemporaryFile(delete=False).name
+            # Capture snapshot at beginning of motion event for thumbnail.
+            # Written next to the destination and swapped in atomically:
+            # an upload of the previous event's snapshot may still hold
+            # the old inode open.
+            dst = self._motion_snapshot_scratch()
+            part = dst.with_name(dst.name + ".part")
             try:
-                shutil.copyfile(await self.get_snapshot(), motion_snapshot_path)
-                self.logger.debug(f"Captured motion snapshot to {motion_snapshot_path}")
-                self._motion_snapshot = Path(motion_snapshot_path)
+                shutil.copyfile(await self.get_snapshot(), part)
+                os.replace(part, dst)
+                self.logger.debug(f"Captured motion snapshot to {dst}")
+                self._motion_snapshot = dst
             except FileNotFoundError:
-                pass
+                part.unlink(missing_ok=True)
 
     # Slightly above the sidecar's report interval so each box is
     # replaced before it lingers — 5000 painted a comet trail of
@@ -514,6 +531,45 @@ class UnifiCamBase(metaclass=ABCMeta):
 
     def update_motion_snapshot(self, path: Path) -> None:
         self._motion_snapshot = path
+
+    def _motion_snapshot_scratch(self) -> Path:
+        if self._motion_snapshot_file is None:
+            fd, name = tempfile.mkstemp(prefix="motionsnap-", suffix=".jpg")
+            os.close(fd)
+            self._motion_snapshot_file = Path(name)
+        return self._motion_snapshot_file
+
+    # How long a finished per-object crop stays on disk once its event
+    # is over. Protect fetches crops right after the stop payload, so
+    # this only needs to outlive a slow NVR, not a long event: crops
+    # belonging to the event still in progress are never pruned.
+    CROP_RETENTION_SEC = 600
+
+    def prune_stale_crops(self) -> None:
+        cutoff = time.time() - self.CROP_RETENTION_SEC
+        in_flight = {e["smartDetectSnapshot"] for e in self._smart_snapshots}
+        for fname, path in list(self._smart_snapshot_files.items()):
+            if fname in in_flight:
+                continue
+            try:
+                if path.stat().st_mtime < cutoff:
+                    path.unlink()
+                    del self._smart_snapshot_files[fname]
+            except FileNotFoundError:
+                del self._smart_snapshot_files[fname]
+
+    def _remove_scratch_files(self) -> None:
+        for path in self._smart_snapshot_files.values():
+            path.unlink(missing_ok=True)
+        self._smart_snapshot_files = {}
+        if self._motion_snapshot_file is not None:
+            part = self._motion_snapshot_file.with_name(
+                self._motion_snapshot_file.name + ".part"
+            )
+            part.unlink(missing_ok=True)
+            self._motion_snapshot_file.unlink(missing_ok=True)
+            self._motion_snapshot_file = None
+        self._motion_snapshot = None
 
     async def fetch_to_file(self, url: str, dst: Path) -> bool:
         try:
@@ -1421,20 +1477,146 @@ class UnifiCamBase(metaclass=ABCMeta):
                 f"Spawning ffmpeg for {stream_index} ({stream_name}):"
                 f" {self.redact_secrets(cmd)}"
             )
+            # start_new_session: the whole pipeline (ffmpeg, the
+            # hevc_flv/clock_sync helpers, nc) shares one process
+            # group so stop_video_stream can tear it down as a unit
+            # instead of orphaning ffmpeg when only the shell is killed.
+            self._stream_meta[stream_index] = (stream_name, destination)
             self._ffmpeg_handles[stream_index] = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, shell=True
+                cmd,
+                stdout=subprocess.DEVNULL,
+                shell=True,
+                start_new_session=True,
             )
 
     def stop_video_stream(self, stream_index: str):
-        if stream_index in self._ffmpeg_handles:
-            self.logger.info(f"Stopping stream {stream_index}")
-            self._ffmpeg_handles[stream_index].kill()
+        handle = self._ffmpeg_handles.pop(stream_index, None)
+        self._stream_meta.pop(stream_index, None)
+        if handle is None:
+            return
+        self.logger.info(f"Stopping stream {stream_index}")
+        try:
+            os.killpg(os.getpgid(handle.pid), signal.SIGKILL)
+        except (ProcessLookupError, PermissionError):
+            try:
+                handle.kill()
+            except ProcessLookupError:
+                pass
 
     async def close(self):
         self.logger.info("Cleaning up instance")
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            self._watchdog_task = None
         await self.trigger_motion_stop()
         self.close_streams()
+        self._remove_scratch_files()
 
     def close_streams(self):
-        for stream in self._ffmpeg_handles:
+        for stream in list(self._ffmpeg_handles):
             self.stop_video_stream(stream)
+
+    # --- stream watchdog -------------------------------------------------
+    # ffmpeg feeds Protect through a shell pipeline
+    # (ffmpeg | hevc_flv | clock_sync | nc). Popen tracks the *shell*, and
+    # the shell lives as long as ffmpeg does, so poll() cannot see a stream
+    # that is alive but delivering nothing — a collapsing camera uplink
+    # (ffmpeg starved) or an NVR that dropped the FLV socket (nc gone). Both
+    # silently stop recording. The watchdog restarts a stream that produces
+    # no output for STREAM_SILENCE_LIMIT_SEC, or exited outright.
+    STREAM_WATCHDOG_INTERVAL_SEC = 15
+    STREAM_SILENCE_LIMIT_SEC = 45
+
+    async def _watch_streams(self) -> None:
+        progress: dict[str, tuple[int, float]] = {}
+        try:
+            while True:
+                await asyncio.sleep(self.STREAM_WATCHDOG_INTERVAL_SEC)
+                try:
+                    await self._watchdog_tick(progress)
+                except Exception:
+                    self.logger.exception("Stream watchdog tick failed")
+        except asyncio.CancelledError:
+            raise
+
+    async def _watchdog_tick(
+        self, progress: dict[str, tuple[int, float]], now: Optional[float] = None
+    ) -> None:
+        now = time.time() if now is None else now
+        for stream_index, handle in list(self._ffmpeg_handles.items()):
+            meta = self._stream_meta.get(stream_index)
+            if handle.poll() is not None:
+                self.logger.warning(
+                    f"Stream {stream_index} pipeline exited"
+                    f" (rc={handle.returncode}); restarting"
+                )
+                progress.pop(stream_index, None)
+                if meta:
+                    await self.start_video_stream(stream_index, meta[0], meta[1])
+                continue
+            produced = self._stream_output_bytes(stream_index)
+            if produced is None:
+                continue  # can't measure output here; never a false restart
+            prev = progress.get(stream_index)
+            if prev is None or produced > prev[0]:
+                progress[stream_index] = (produced, now)
+                continue
+            silent_for = now - prev[1]
+            if silent_for >= self.STREAM_SILENCE_LIMIT_SEC:
+                self.logger.warning(
+                    f"Stream {stream_index} produced no output for"
+                    f" {int(silent_for)}s; forcing restart"
+                )
+                progress.pop(stream_index, None)
+                self.stop_video_stream(stream_index)
+                if meta:
+                    await self.start_video_stream(stream_index, meta[0], meta[1])
+
+    def _stream_output_bytes(self, stream_index: str) -> Optional[int]:
+        """Total bytes written by the pipeline for a stream, or None.
+
+        Sums wchar across every descendant of the tracked shell (ffmpeg and
+        the nc/helper stages). A healthy stream advances this every second;
+        a stalled one flatlines. Returns None off Linux / without /proc so
+        the watchdog degrades to exit-detection only.
+        """
+        handle = self._ffmpeg_handles.get(stream_index)
+        if handle is None:
+            return None
+        total = 0
+        seen = False
+        for pid in self._descendant_pids(handle.pid):
+            try:
+                with open(f"/proc/{pid}/io") as f:
+                    for line in f:
+                        if line.startswith("wchar:"):
+                            total += int(line.split()[1])
+                            seen = True
+                            break
+            except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+                continue
+        return total if seen else None
+
+    @staticmethod
+    def _descendant_pids(root: int) -> list[int]:
+        try:
+            pids = [int(p) for p in os.listdir("/proc") if p.isdigit()]
+        except OSError:
+            return []
+        children: dict[int, list[int]] = {}
+        for pid in pids:
+            try:
+                with open(f"/proc/{pid}/stat") as f:
+                    data = f.read()
+                # comm (field 2) may contain spaces/parens; ppid follows ')'.
+                ppid = int(data[data.rindex(")") + 1 :].split()[1])
+            except (OSError, ValueError, IndexError):
+                continue
+            children.setdefault(ppid, []).append(pid)
+        out: list[int] = []
+        stack = list(children.get(root, []))
+        while stack:
+            pid = stack.pop()
+            out.append(pid)
+            stack.extend(children.get(pid, []))
+        return out

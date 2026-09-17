@@ -30,6 +30,18 @@ services:
       - video
     volumes:
       - ./client.pem:/client.pem:ro
+      # Scratch space (motion snapshots, per-object crops) on a bounded
+      # tmpfs: the app now cleans up after itself, but a regression must
+      # never again fill the host's docker.img, and a restart wipes it.
+      - type: tmpfs
+        target: /tmp
+        tmpfs:
+          size: 536870912 # 512 MiB
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     command:
       - unifi-cam-proxy
       - --host
@@ -123,6 +135,11 @@ services:
     build: ./ai-sidecar
     container_name: reolink-ai-sidecar
     restart: unless-stopped
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"
     depends_on:
       - reolink-floodlight-proxy
     environment:
