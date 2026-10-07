@@ -180,8 +180,11 @@ class UnifiCamBase(metaclass=ABCMeta):
         while True:
             try:
                 msg = await ws.recv()
-            except websockets.exceptions.ConnectionClosedError:
-                self.logger.info(f"Connection to {self.args.host} was closed.")
+            except websockets.exceptions.ConnectionClosed as e:
+                # Includes a clean 1000 close (ConnectionClosedOK), which
+                # Protect sends e.g. when it rejects a hello; letting that
+                # escape crashed the whole process.
+                self.logger.info(f"Connection to {self.args.host} was closed: {e}")
                 raise RetryableError()
 
             if msg is not None:
@@ -660,20 +663,49 @@ class UnifiCamBase(metaclass=ABCMeta):
             },
         )
 
-    async def process_upgrade(self, msg: AVClientRequest) -> None:
-        url = msg["payload"]["uri"]
+    # Download filenames carry the short version, e.g.
+    # .../e7fc-sav837gw-5.4.132-<uuid>.bin
+    FW_FILENAME_VERSION = re.compile(r"-(\d+\.\d+\.\d+)-[^/]*\.bin$")
+    # Legacy (pre-sysid) binaries carry a plaintext long-form version at
+    # offset 4, e.g. UVC.S2L.v4.23.8.67.0eba6e3.200526.1046.
+    FW_HEADER_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{5,49}")
+
+    async def _fetch_firmware_header(self, url: str) -> bytes:
         headers = {"Range": "bytes=0-100"}
         async with aiohttp.ClientSession() as session:
             async with session.get(url, headers=headers, ssl=False) as r:
-                # Parse the new version string from the upgrade binary
-                content = await r.content.readexactly(54)
-                version = ""
-                for i in range(0, 50):
-                    b = content[4 + i]
-                    if b != b"\x00":
-                        version += chr(b)
-                self.logger.debug(f"Pretending to upgrade to: {version}")
-                self.args.fw_version = version
+                return await r.content.readexactly(54)
+
+    async def process_upgrade(self, msg: AVClientRequest) -> None:
+        """Pretend to install the pushed firmware by adopting its version.
+
+        The reconnect that follows reports the new version, so Protect
+        stops re-pushing it. An unrecognisable version is never adopted:
+        reconnecting with junk gets the socket closed by Protect.
+        """
+        url = msg["payload"]["uri"]
+        version = None
+        m = self.FW_FILENAME_VERSION.search(urllib.parse.urlparse(url).path)
+        if m:
+            version = m.group(1)
+        else:
+            try:
+                raw = (await self._fetch_firmware_header(url))[4:54]
+                text = raw.split(b"\x00", 1)[0].decode("ascii")
+                if self.FW_HEADER_VERSION.fullmatch(text):
+                    version = text
+            except Exception as e:
+                self.logger.warning(f"Firmware header fetch failed: {e}")
+        if version is None:
+            self.logger.warning(
+                f"Ignoring firmware push: no version found in {url};"
+                f" staying on {self.args.fw_version}"
+            )
+            return
+        self.logger.info(
+            f"Pretending to upgrade firmware {self.args.fw_version} -> {version}"
+        )
+        self.args.fw_version = version
 
     async def process_isp_settings(self, msg: AVClientRequest) -> AVClientResponse:
         payload = {

@@ -71,9 +71,12 @@ services:
       - "sav837gw"
       # Claim the current release (what the real cameras run) so Protect
       # doesn't offer/push an upgrade to a camera that can't take one
-      # (auto-update is scheduled for 03:00 on this NVR).
+      # (auto-update is scheduled for 03:00 on this NVR). Latest release
+      # for sav837gw: https://fw-update.ui.com/api/firmware-latest?filter=eq~~platform~~sav837gw&filter=eq~~product~~uvc
+      # fw-build is still 5.4.122's: 5.4.132's header is obfuscated, so
+      # its real build string is unknown.
       - --fw-version
-      - "5.4.122"
+      - "5.4.132"
       - --fw-build
       - "92ebf37.260724.1639"
       - rtsp

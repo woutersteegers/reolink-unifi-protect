@@ -18,6 +18,7 @@ class Core(object):
         self.args = args
         self.logger = logger
         self.cam = camera
+        self.guid = str(uuid.uuid4())
 
         # Set up ssl context for requests
         self.ssl_context = ssl.create_default_context()
@@ -25,8 +26,7 @@ class Core(object):
         self.ssl_context.verify_mode = ssl.CERT_NONE
         self.ssl_context.load_cert_chain(args.cert, args.cert)
 
-    async def run(self) -> None:
-        uri = "wss://{}:7442/camera/1.0/ws?token={}".format(self.host, self.token)
+    def _headers(self) -> dict:
         headers = {"camera-mac": self.mac}
         if getattr(self.args, "sysid", None):
             # Real cameras also identify on the WSS handshake. camera-model
@@ -40,9 +40,13 @@ class Core(object):
                     "device-id": str(
                         uuid.uuid5(uuid.NAMESPACE_DNS, f"unifi-cam-proxy-{self.mac}")
                     ),
-                    "x-guid": str(uuid.uuid4()),
+                    "x-guid": self.guid,
                 }
             )
+        return headers
+
+    async def run(self) -> None:
+        uri = "wss://{}:7442/camera/1.0/ws?token={}".format(self.host, self.token)
         has_connected = False
 
         @backoff.on_predicate(
@@ -60,9 +64,11 @@ class Core(object):
                 f" wss://{self.host}:7442/camera/1.0/ws?token={self.token[:4]}…"
             )
             try:
+                # Rebuilt per attempt: camera-firmware must follow a
+                # simulated upgrade (process_upgrade) across the reconnect.
                 ws = await websockets.connect(
                     uri,
-                    extra_headers=headers,
+                    extra_headers=self._headers(),
                     ssl=self.ssl_context,
                     subprotocols=["secure_transfer"],
                 )
