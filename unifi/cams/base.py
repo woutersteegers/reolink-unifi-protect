@@ -462,9 +462,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventType": "motion",
             "objectTypes": sorted({d["objectType"] for d in descriptors}),
             "zonesStatus": {
-                str(z): {"status": "moving"}
-                for d in descriptors
-                for z in d["zones"]
+                str(z): {"status": "moving"} for d in descriptors for z in d["zones"]
             }
             or {"1": {"status": "moving"}},
             "displayTimeoutMSec": self.SMART_DISPLAY_TIMEOUT_MS,
@@ -504,8 +502,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                 if self._smart_snapshots:
                     payload["smartDetectSnapshots"] = list(self._smart_snapshots)
                     payload["trackerIDAttrMap"] = {
-                        str(entry["trackerID"]): {}
-                        for entry in self._smart_snapshots
+                        str(entry["trackerID"]): {} for entry in self._smart_snapshots
                     }
                     self.logger.info(
                         "Announcing object crops: "
@@ -856,15 +853,17 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "N": 30,
                         "avSerializer": {
                             "destinations": vid_dst["video1"],
-                            "parameters": None
-                            if "video1" not in self._streams
-                            else {
-                                "audioId": None,
-                                "streamName": self._streams["video1"],
-                                "suppressAudio": None,
-                                "suppressVideo": None,
-                                "videoId": None,
-                            },
+                            "parameters": (
+                                None
+                                if "video1" not in self._streams
+                                else {
+                                    "audioId": None,
+                                    "streamName": self._streams["video1"],
+                                    "suppressAudio": None,
+                                    "suppressVideo": None,
+                                    "videoId": None,
+                                }
+                            ),
                             "type": "extendedFlv",
                         },
                         "bitRateCbrAvg": 6000000,
@@ -915,15 +914,17 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "N": 30,
                         "avSerializer": {
                             "destinations": vid_dst["video2"],
-                            "parameters": None
-                            if "video2" not in self._streams
-                            else {
-                                "audioId": None,
-                                "streamName": self._streams["video2"],
-                                "suppressAudio": None,
-                                "suppressVideo": None,
-                                "videoId": None,
-                            },
+                            "parameters": (
+                                None
+                                if "video2" not in self._streams
+                                else {
+                                    "audioId": None,
+                                    "streamName": self._streams["video2"],
+                                    "suppressAudio": None,
+                                    "suppressVideo": None,
+                                    "videoId": None,
+                                }
+                            ),
                             "type": "extendedFlv",
                         },
                         "bitRateCbrAvg": 500000,
@@ -975,15 +976,17 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "N": 30,
                         "avSerializer": {
                             "destinations": vid_dst["video3"],
-                            "parameters": None
-                            if "video3" not in self._streams
-                            else {
-                                "audioId": None,
-                                "streamName": self._streams["video3"],
-                                "suppressAudio": None,
-                                "suppressVideo": None,
-                                "videoId": None,
-                            },
+                            "parameters": (
+                                None
+                                if "video3" not in self._streams
+                                else {
+                                    "audioId": None,
+                                    "streamName": self._streams["video3"],
+                                    "suppressAudio": None,
+                                    "suppressVideo": None,
+                                    "videoId": None,
+                                }
+                            ),
                             "type": "extendedFlv",
                         },
                         "bitRateCbrAvg": 300000,
@@ -1222,9 +1225,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             )
         if msg["functionName"] == "ChangeSmartDetectSettings":
             self.smart_detect_zones = self._parse_zone_map(payload.get("zones"))
-            self.smart_exclude_zones = self._parse_zone_map(
-                payload.get("excludeZones")
-            )
+            self.smart_exclude_zones = self._parse_zone_map(payload.get("excludeZones"))
             for label, zmap in (
                 ("zones", self.smart_detect_zones),
                 ("exclude zones", self.smart_exclude_zones),
@@ -1251,8 +1252,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             if len(coord) < 6 or len(coord) % 2:
                 continue
             poly = [
-                (float(coord[i]), float(coord[i + 1]))
-                for i in range(0, len(coord), 2)
+                (float(coord[i]), float(coord[i + 1])) for i in range(0, len(coord), 2)
             ]
             types = zone.get("objectTypes")
             zones[str(zid)] = {
@@ -1273,9 +1273,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             j = i
         return inside
 
-    def smart_zones_containing(
-        self, kind: str, x: float, y: float
-    ) -> Optional[list]:
+    def smart_zones_containing(self, kind: str, x: float, y: float) -> Optional[list]:
         """Zone ids whose polygon contains (x, y) and whose class list
         allows `kind`. None = no zone config known (filtering off);
         [] = the point is outside every applicable zone (drop it)."""

@@ -10,7 +10,7 @@ unless marked so.
 Protect ingests camera streams as FLV over TCP, but real UniFi cameras do not
 use standard FLV for H.265. What actually works:
 
-- **Video tags use FLV codec id 8** (the legacy "AVC" slot re-used), not
+- **Video tags use FLV codec id 8** (the legacy "AVC" slot reused), not
   Enhanced-RTMP `hvc1` fourcc tags. ffmpeg ≥ 6.1 emits enhanced-FLV `hvc1`
   extended tags for HEVC; `unifi/hevc_flv.py` translates them to the UniFi
   framing on the fly.

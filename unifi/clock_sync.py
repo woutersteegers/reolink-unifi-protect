@@ -1,6 +1,7 @@
-""""
+"""
 Helper program to inject absolute wall clock time into FLV stream for recordings
 """
+
 import argparse
 import struct
 import sys
