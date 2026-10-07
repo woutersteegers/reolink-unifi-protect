@@ -199,8 +199,12 @@ def test_real_stop_falls_back_when_group_gone(cert, monkeypatch):
     assert "video1" not in cam._ffmpeg_handles
 
 
-def test_close_streams_tolerates_handle_removal(cert):
+def test_close_streams_tolerates_handle_removal(cert, monkeypatch):
     # stop now mutates _ffmpeg_handles; close_streams must not choke.
+    # Stub the kill: these fake pids are real pids on the host, and as
+    # root (CI containers) a real killpg would SIGKILL the test runner.
+    monkeypatch.setattr(os, "getpgid", lambda pid: pid)
+    monkeypatch.setattr(os, "killpg", lambda pgid, sig: None)
     args = argparse.Namespace(
         cert=str(cert),
         source=["rtsp://cam/main"],
