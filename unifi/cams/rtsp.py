@@ -108,6 +108,21 @@ class RTSPCam(UnifiCamBase):
             " kills stationary false positives like buildings; 0 disables)",
         )
         parser.add_argument(
+            "--ai-movement-box-ratio",
+            default=0.25,
+            type=float,
+            help="Movement must also exceed this fraction of the box's"
+            " smaller side, so box-size jitter on large static objects"
+            " doesn't count as motion (0 = use --ai-min-movement only)",
+        )
+        parser.add_argument(
+            "--ai-movement-reports",
+            default=2,
+            type=int,
+            help="Consecutive box reports (~0.4s apart) that must show the"
+            " movement before a track counts as moving; 1 = no smoothing",
+        )
+        parser.add_argument(
             "--ai-classes",
             default="person,vehicle,animal",
             help="Detection classes to forward, in priority order",
@@ -204,11 +219,7 @@ class RTSPCam(UnifiCamBase):
             t
             for t in self._ai_tracks
             if now - t["last_ts"]
-            < (
-                self.AI_TRACK_EXPIRE_SEC
-                if t["moved"] >= self.args.ai_min_movement
-                else self.AI_STATIC_EXPIRE_SEC
-            )
+            < (self.AI_TRACK_EXPIRE_SEC if t["moving"] else self.AI_STATIC_EXPIRE_SEC)
         ]
         out = []
         for box in boxes:
@@ -233,19 +244,53 @@ class RTSPCam(UnifiCamBase):
                     "ox": cx,
                     "oy": cy,
                     "first_ts": now,
-                    "moved": 0.0,
+                    "moving": False,
+                    "streak": 0,
                 }
                 self._ai_tracks.append(track)
             # Stable per-object id: without it the Protect UI stacks a
             # fresh box per update instead of moving one.
             box["track_id"] = track["id"]
             track["cx"], track["cy"], track["last_ts"] = cx, cy, now
-            track["moved"] = max(
-                track["moved"], abs(cx - track["ox"]) + abs(cy - track["oy"])
-            )
-            if track["moved"] >= self.args.ai_min_movement:
+            # Latched: a person who walks in and then stands still keeps
+            # their event. The latch is why the decision itself must be
+            # robust — one jittery report used to flip a sprinkler to
+            # "moving" for good (5k phantom animal boxes in 72h).
+            if not track["moving"]:
+                track["moving"] = self._track_has_moved(
+                    track,
+                    abs(cx - track["ox"]) + abs(cy - track["oy"]),
+                    coord[2],
+                    coord[3],
+                )
+            if track["moving"]:
                 out.append(box)
         return out
+
+    def _track_has_moved(
+        self, track: dict, displacement: float, w: float, h: float
+    ) -> bool:
+        """Does this report show a not-yet-moving track really moving?
+
+        `displacement` is the Manhattan distance (0-1000 units) of the box
+        centre from where the track was first seen; `w`/`h` are this
+        report's box size. `track["streak"]` is free for counting
+        consecutive qualifying reports (reports arrive every ~0.4s).
+
+        Must ignore detector jitter on static scenery: the backyard
+        sprinkler reports as [805, 923, 34, 74] but occasionally as
+        75 wide or 148 tall, shifting its centre ~20 units for a single
+        report. Must still pass a person walking through the yard.
+        """
+        threshold = max(
+            self.args.ai_min_movement,
+            self.args.ai_movement_box_ratio * min(w, h),
+        )
+        if displacement >= threshold:
+            track["streak"] += 1
+        else:
+            track["streak"] = 0
+        return track["streak"] >= self.args.ai_movement_reports
 
     def _min_confidence(self, kind: str) -> float:
         overrides = getattr(self, "_conf_overrides", None)
