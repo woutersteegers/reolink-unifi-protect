@@ -112,14 +112,15 @@ services:
       # still burying the flicker.
       - --ai-confidence-overrides
       - "animal=0.6"
-      # Audio passthrough: the camera's main stream is AAC 44.1k stereo
-      # (ffprobe, 2026-10-30), which Protect plays as is, and FFmpeg 7.1
-      # copies into FLV fine. Timestamps come from the camera's RTP clock
-      # (wallclock stamping removed in base.py) so the samples line up
-      # gaplessly; an AAC re-encode would re-frame them. Re-encoding is
-      # opt-in (--lo-audio-args).
+      # Audio must be re-encoded on FFmpeg 7.1 (the image's): copying this
+      # camera's AAC (44.1k stereo) yields the config tag but ZERO audio
+      # packets, in FLV and even in MKV, while decoding works. Protect then
+      # gets a stream that announces audio and never sends any, and
+      # restarts it every ~30s (seen 2026-10-30). 16k mono AAC is what real
+      # UniFi cameras send. Timestamps still come from the camera's RTP
+      # clock (wallclock stamping removed in base.py).
       - --ffmpeg-args
-      - "-c:v copy -c:a copy"
+      - "-c:v copy -ar 16000 -ac 1 -c:a aac -b:a 32k"
       - --hi-codec
       - h265
       - --hi-width
@@ -131,6 +132,10 @@ services:
       - --lo-codec
       - h265
       - --lo-h265-transcode
+      # Same reason as --ffmpeg-args: the transcoded channels copy audio
+      # by default, which FFmpeg 7.1 drops for this camera.
+      - --lo-audio-args
+      - "-ar 16000 -ac 1 -c:a aac -b:a 32k"
       - --lo-width
       - "1920"
       - --lo-height
