@@ -28,6 +28,11 @@ services:
       - /dev/dri:/dev/dri
     group_add:
       - video
+    # Pin the Intel media driver: the image also ships Mesa (AMD) and
+    # leaves libva to auto-detect. The proxy checks at startup that this
+    # driver loaded and can encode ("iGPU check passed/FAILED").
+    environment:
+      - LIBVA_DRIVER_NAME=iHD
     volumes:
       - ./client.pem:/client.pem:ro
       # Scratch space (motion snapshots, per-object crops) on a bounded
@@ -107,11 +112,14 @@ services:
       # still burying the flicker.
       - --ai-confidence-overrides
       - "animal=0.6"
-      # Copy video and re-encode audio for FFmpeg 7 FLV compatibility.
-      # Timestamps come from the camera's RTP clock (wallclock stamping
-      # removed in base.py) so the samples line up gaplessly.
+      # Audio passthrough: the camera's main stream is AAC 44.1k stereo
+      # (ffprobe, 2026-10-30), which Protect plays as is, and FFmpeg 7.1
+      # copies into FLV fine. Timestamps come from the camera's RTP clock
+      # (wallclock stamping removed in base.py) so the samples line up
+      # gaplessly; an AAC re-encode would re-frame them. Re-encoding is
+      # opt-in (--lo-audio-args).
       - --ffmpeg-args
-      - "-c:v copy -ar 16000 -ac 1 -c:a aac -b:a 32k"
+      - "-c:v copy -c:a copy"
       - --hi-codec
       - h265
       - --hi-width
@@ -123,8 +131,6 @@ services:
       - --lo-codec
       - h265
       - --lo-h265-transcode
-      - --lo-audio-args
-      - "-ar 16000 -ac 1 -c:a aac -b:a 32k"
       - --lo-width
       - "1920"
       - --lo-height
