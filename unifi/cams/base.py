@@ -5,6 +5,7 @@ import json
 import logging
 import os
 import re
+import shlex
 import shutil
 import signal
 import ssl
@@ -14,6 +15,7 @@ import tempfile
 import time
 import urllib
 from abc import ABCMeta, abstractmethod
+from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
 from typing import Any, Optional
@@ -25,6 +27,29 @@ import websockets
 from unifi.core import RetryableError
 
 AVClientRequest = AVClientResponse = dict[str, Any]
+
+
+def jpeg_size(path: Path) -> Optional[tuple[int, int]]:
+    """(width, height) from a JPEG's start-of-frame marker, or None if unreadable."""
+    try:
+        data = path.read_bytes()[:65536]
+    except OSError:
+        return None
+    i = 2
+    while i + 9 < len(data):
+        if data[i] != 0xFF:
+            i += 1
+            continue
+        marker = data[i + 1]
+        if marker == 0xFF:
+            i += 1
+            continue
+        if 0xC0 <= marker <= 0xCF and marker not in (0xC4, 0xC8, 0xCC):
+            height = int.from_bytes(data[i + 5 : i + 7], "big")
+            width = int.from_bytes(data[i + 7 : i + 9], "big")
+            return (width, height) if width and height else None
+        i += 2 + int.from_bytes(data[i + 2 : i + 4], "big")
+    return None
 
 
 class SmartDetectObjectType(Enum):
@@ -60,6 +85,9 @@ class UnifiCamBase(metaclass=ABCMeta):
         self.smart_detect_enabled: Optional[set] = None
         self.smart_detect_zones: Optional[dict] = None
         self.smart_exclude_zones: Optional[dict] = None
+        # Must stay small: Protect's ds daemon parses trackerID as a u32, and
+        # trackerID is derived from this id (see trigger_motion_start). Seeding
+        # it from the epoch overflowed that field and every event was dropped.
         self._motion_event_id: int = 0
         self._motion_event_ts: Optional[float] = None
         self._motion_object_type: Optional[SmartDetectObjectType] = None
@@ -106,12 +134,23 @@ class UnifiCamBase(metaclass=ABCMeta):
         parser.add_argument(
             "--hw-transcode",
             action="store_true",
-            help="Hardware-transcode video to H.264 via Intel QSV (iGPU)",
+            help="Hardware-transcode the high stream to H.264 using --hw-backend",
+        )
+        parser.add_argument(
+            "--hw-backend",
+            default="qsv",
+            choices=["qsv", "vaapi"],
+            help="Hardware backend: qsv for Intel (default), vaapi for AMD/Mesa",
+        )
+        parser.add_argument(
+            "--vaapi-driver",
+            default=None,
+            help="Optional libva driver override (e.g. iHD or radeonsi); default: auto",
         )
         parser.add_argument(
             "--hw-device",
             default="/dev/dri/renderD128",
-            help="Intel render node for --hw-transcode",
+            help="DRM render node for hardware transcoding",
         )
         parser.add_argument(
             "--transcode-width",
@@ -123,7 +162,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             "--transcode-height",
             default=776,
             type=int,
-            help="Output height for --hw-transcode (vpp_qsv needs both explicitly)",
+            help="Output height for --hw-transcode",
         )
         parser.add_argument(
             "--transcode-bitrate",
@@ -164,12 +203,31 @@ class UnifiCamBase(metaclass=ABCMeta):
         parser.add_argument(
             "--lo-h265-transcode",
             action="store_true",
-            help="QSV-transcode the medium/low channels to H.265",
+            help="Hardware-transcode the medium/low channels to H.265 using --hw-backend",
         )
         parser.add_argument(
             "--lo-transcode-bitrate",
             default="1M",
             help="Bitrate for --lo-h265-transcode",
+        )
+
+        parser.add_argument(
+            "--lo-audio-args",
+            default=None,
+            help="Audio args for --lo-h265-transcode only; default: QSV copy, "
+            "VA-API AAC 16k mono. For FFmpeg 7 use '-ar 16000 -ac 1 -c:a aac -b:a 32k'",
+        )
+        parser.add_argument(
+            "--no-audio",
+            action="store_true",
+            help="Disable audio on every channel, including the reolink source",
+        )
+        parser.add_argument(
+            "--lo-scale",
+            action="store_true",
+            help="With --lo-h265-transcode, scale lower channels to --lo-width x "
+            "--lo-height using Intel QSV or VA-API (--hw-backend). A shared relay "
+            "is required to consolidate upstream camera connections",
         )
 
     async def _run(self, ws) -> None:
@@ -202,6 +260,26 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def change_video_settings(self, options) -> None:
         return
 
+    async def reboot_camera(self) -> None:
+        """Called when Protect asks the camera to reboot; override to act."""
+        return
+
+    async def continuous_move(self, x: int, y: int, z: int) -> None:
+        """Called on each Protect PTZ joystick/zoom tick; override to act."""
+        return
+
+    async def ptz_position(self) -> Optional[dict[str, Any]]:
+        """Reply payload for GetCurrentPosition, or None to just echo the request."""
+        return None
+
+    async def spotlight(self, duration_s: int) -> None:
+        """Called for Protect's TurnOnColorNightVision (light on for duration_s)."""
+        return
+
+    async def ptz_preset(self, payload: dict[str, Any]) -> None:
+        """Called for Protect's Preset/Home messages (home view is slot -1)."""
+        return
+
     @abstractmethod
     async def get_snapshot(self) -> Path:
         raise NotImplementedError("You need to write this!")
@@ -214,8 +292,10 @@ class UnifiCamBase(metaclass=ABCMeta):
     def redact_secrets(text: str) -> str:
         # `docker logs` is shared freely; stream URLs carry the camera
         # password (rtsp://user:pass@host), so scrub credentials before any
-        # command line or URL is logged.
-        return re.sub(r"//[^/@\s\"]+@", "//***:***@", text)
+        # command line or URL is logged. Reolink API URLs carry it as a query
+        # parameter instead.
+        text = re.sub(r"//[^/@\s\"]+@", "//***:***@", text)
+        return re.sub(r"(password=)[^&\s\"']*", r"\1***", text)
 
     def _hw_transcoding(self, stream_index: str = "") -> bool:
         # Only the HIGH-quality stream is transcoded. Protect opens several
@@ -232,6 +312,9 @@ class UnifiCamBase(metaclass=ABCMeta):
             "video3",
         )
 
+    def _hw_backend(self) -> str:
+        return getattr(self.args, "hw_backend", "qsv")
+
     def _emits_h265(self, stream_index: str = "") -> bool:
         # Channels whose FLV output carries HEVC and therefore needs the
         # unifi.hevc_flv rewrite before clock_sync.
@@ -244,17 +327,54 @@ class UnifiCamBase(metaclass=ABCMeta):
         )
 
     def get_extra_ffmpeg_args(self, stream_index: str = "") -> str:
+        args = self._extra_ffmpeg_args(stream_index)
+        if getattr(self.args, "no_audio", False):
+            args += " -an"
+        return args
+
+    def _extra_ffmpeg_args(self, stream_index: str = "") -> str:
+        if self._hw_backend() == "vaapi":
+            if self._lo_h265_transcoding(stream_index):
+                # Keep the substream's size; normalize 10-bit input to the
+                # 8-bit surfaces used by the HEVC Main encoder.
+                lo_fps = getattr(self.args, "lo_fps", None) or 30
+                size = (
+                    f"w={self.args.lo_width}:h={self.args.lo_height}:"
+                    if getattr(self.args, "lo_scale", False)
+                    else ""
+                )
+                audio = getattr(self.args, "lo_audio_args", None) or (
+                    "-ar 16000 -ac 1 -codec:a aac -b:a 32k"
+                )
+                return (
+                    f'-vf "scale_vaapi={size}format=nv12" -c:v hevc_vaapi'
+                    f" -b:v {self.args.lo_transcode_bitrate} -g {lo_fps} -bf 0 {audio}"
+                )
+            if self._hw_transcoding(stream_index):
+                hi_fps = getattr(self.args, "hi_fps", None) or 30
+                return (
+                    f'-vf "scale_vaapi=w={self.args.transcode_width}'
+                    f':h={self.args.transcode_height}:format=nv12"'
+                    f" -c:v h264_vaapi -b:v {self.args.transcode_bitrate}"
+                    f" -g {hi_fps} -bf 0"
+                    " -ar 16000 -ac 1 -codec:a aac -b:a 32k"
+                )
         if self._lo_h265_transcoding(stream_index):
-            # Same dimensions in and out — no scaler, decode straight
-            # into hevc_qsv on the iGPU.
+            # Scaling is opt-in; a relay, not the scaler, shares camera sessions.
             # -g = 1s keyframe cadence: hevc_qsv's default GOP is many
             # seconds long, which forced Protect's thumbnailer to decode
             # 8+s of video per event thumb (10-25s, queueing) — the app
             # then falls back to a stale full-frame snapshot.
             lo_fps = getattr(self.args, "lo_fps", None) or 30
+            scale = (
+                f'-vf "vpp_qsv=w={self.args.lo_width}:h={self.args.lo_height}" '
+                if getattr(self.args, "lo_scale", False)
+                else ""
+            )
+            audio = getattr(self.args, "lo_audio_args", None) or "-c:a copy"
             return (
-                f"-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
-                f" -g {lo_fps} -c:a copy"
+                f"{scale}-c:v hevc_qsv -b:v {self.args.lo_transcode_bitrate}"
+                f" -g {lo_fps} {audio}"
             )
         # Post-input (encode) slot: scale + encode H.264, both on the iGPU.
         if self._hw_transcoding(stream_index):
@@ -280,9 +400,9 @@ class UnifiCamBase(metaclass=ABCMeta):
         # Vocabulary matched to a real G5's measured hello (rjmotion/finch):
         # plural key names, mic as an int, capability booleans alongside.
         codecs = ["h264"]
-        if getattr(self.args, "hi_codec", "h264") == "h265":
+        if self._emits_h265("video1") or self._lo_h265_transcoding("video2"):
             codecs.append("h265")
-        return {
+        flags = {
             "mic": 1,
             "aec": [],
             "videoMode": ["default"],
@@ -302,7 +422,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             "hasHdr": False,
             "hasWdr": True,
             "hasMic": True,
-            "hasSpeaker": False,
+            "hasSpeaker": bool(getattr(self.args, "speaker", False)),
             "hasInfrared": False,
             "hasMotionZones": True,
             "hasPrivacyMask": False,
@@ -315,6 +435,103 @@ class UnifiCamBase(metaclass=ABCMeta):
             "maxScaleDownLevel": 2,
             "downScaleResolutions": [[3840, 2160], [2688, 1512], [1920, 1080]],
         }
+        if getattr(self.args, "doorbell", False):
+            # Protect shows doorbell UI off featureFlags.doorbell
+            flags["doorbell"] = True
+        if getattr(self.args, "ptz", False):
+            # Protect derives isPtz from the short `ptz` key (like `speaker`)
+            flags["ptz"] = True
+            flags["isPtz"] = True
+        if getattr(self.args, "speaker", False):
+            # Protect maps hasSpeaker from the camera's short `speaker` key
+            flags["speaker"] = True
+        if getattr(self.args, "spotlight", False):
+            # Protect maps hasFlash/flashRange from `flash`/`flashRange` and then
+            # offers its light action (it sends TurnOnColorNightVision)
+            flags["flash"] = True
+            flags["hasFlash"] = True
+            flags["flashRange"] = 10
+        return flags
+
+    async def _protect_login(self, session: "aiohttp.ClientSession") -> Optional[str]:
+        base = f"https://{self.args.host}"
+        async with session.post(
+            f"{base}/api/auth/login",
+            headers={"Origin": base, "Referer": base + "/"},
+            json={
+                "username": self.args.protect_ring_user,
+                "password": self.args.protect_ring_password,
+                "rememberMe": False,
+            },
+            ssl=False,
+            timeout=aiohttp.ClientTimeout(total=10),
+        ) as resp:
+            if resp.status != 200:
+                raise RuntimeError(f"Protect login failed: HTTP {resp.status}")
+            return resp.headers.get("X-CSRF-Token") or resp.headers.get(
+                "X-Updated-CSRF-Token"
+            )
+
+    async def trigger_ring(self) -> None:
+        # Protect has no camera->NVR ring message; a real ring (push, call
+        # screen, thumbnail, chip) comes from the Access doorbell endpoint,
+        # which needs a normal login session (an Integration API key gets 401).
+        self.logger.info("Doorbell button press detected")
+        user = getattr(self.args, "protect_ring_user", None)
+        if not user or not getattr(self.args, "protect_ring_password", None):
+            self.logger.info("No --protect-ring-user/password; not ringing Protect")
+            return
+        now = time.time()
+        if now - getattr(self, "_last_ring_ts", 0) < 10:
+            return
+        self._last_ring_ts = now
+        base = f"https://{self.args.host}"
+        mac = self.args.mac.replace(":", "").upper()
+        jar = aiohttp.CookieJar(unsafe=True)
+        try:
+            async with aiohttp.ClientSession(cookie_jar=jar) as session:
+                for attempt in (1, 2):
+                    csrf = await self._protect_login(session)
+                    headers = {"Origin": base, "Referer": base + "/"}
+                    if csrf:
+                        headers["X-CSRF-Token"] = csrf
+                    async with session.get(
+                        f"{base}/proxy/protect/api/cameras",
+                        headers=headers,
+                        ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        cams = await resp.json(content_type=None)
+                    cam = next(
+                        (
+                            c
+                            for c in cams
+                            if str(c.get("mac", "")).replace(":", "").upper() == mac
+                        ),
+                        None,
+                    )
+                    if not cam:
+                        self.logger.warning(f"Camera {mac} not found in Protect")
+                        return
+                    start = int(now * 1000)
+                    async with session.post(
+                        f"{base}/proxy/protect/api/events/access/action",
+                        headers=headers,
+                        json={
+                            "action": "door_bell",
+                            "camera_id": cam["id"],
+                            "start_time": start,
+                            "end_time": start + 3000,
+                        },
+                        ssl=False,
+                        timeout=aiohttp.ClientTimeout(total=10),
+                    ) as resp:
+                        if resp.status in (401, 403) and attempt == 1:
+                            continue
+                        self.logger.info(f"Rang Protect: HTTP {resp.status}")
+                        return
+        except Exception as e:
+            self.logger.warning(f"Ringing Protect failed: {e}")
 
     # API for subclasses
     async def trigger_motion_start(
@@ -350,9 +567,9 @@ class UnifiCamBase(metaclass=ABCMeta):
                     descriptors = [
                         self.build_smart_descriptor(
                             object_type.value,
-                            [250, 250, 500, 500],
+                            self.SYNTHETIC_BOX,
                             0.9,
-                            (self._motion_event_id + 1) * 100,
+                            self.synthetic_tracker_id(),
                         )
                     ]
                 payload.update(
@@ -363,12 +580,13 @@ class UnifiCamBase(metaclass=ABCMeta):
                         # status label — a bare number fails the whole
                         # AJV message.
                         "zonesStatus": {
-                            str(z): {"status": "enter"}
+                            str(z): {"level": self.SMART_ZONE_LEVEL, "status": "enter"}
                             for d in descriptors
                             for z in d["zones"]
                         }
-                        or {"1": {"status": "enter"}},
+                        or {"1": {"level": self.SMART_ZONE_LEVEL, "status": "enter"}},
                         "smartDetectSnapshot": "",
+                        **self.EMPTY_SNAPSHOT_FIELDS,
                         # Protect 7.x validates this against its
                         # smartDetectObjectsTransformMessage schema and
                         # derives the event's smartDetectTypes ONLY from
@@ -389,9 +607,9 @@ class UnifiCamBase(metaclass=ABCMeta):
                 else ""
             )
             await self.send(
-                self.gen_response(
+                self.gen_event(
                     "EventSmartDetect" if object_type else "EventAnalytics",
-                    payload=payload,
+                    payload,
                 ),
             )
             self._motion_event_ts = time.time()
@@ -416,6 +634,30 @@ class UnifiCamBase(metaclass=ABCMeta):
     # stale positions behind moving subjects.
     SMART_DISPLAY_TIMEOUT_MS = 600
 
+    # ds requires a `level` next to `status` in every zonesStatus entry (real
+    # cameras send 0-100, ~65-90 while something is in the zone); without it
+    # the frame fails ds's typed parse and is relayed to Protect, which
+    # rejects it as "not expected over avclient".
+    SMART_ZONE_LEVEL = 80
+
+    # Centred box (Protect's 0-1000 [x, y, w, h] space) used when a detection
+    # has no coordinates of its own, e.g. the camera's push events.
+    SYNTHETIC_BOX = [250, 250, 500, 500]
+
+    def synthetic_tracker_id(self) -> int:
+        return (self._motion_event_id + 1) * 100
+
+    # Present (empty) on every real enter/moving frame; the leave frame fills them in.
+    EMPTY_SNAPSHOT_FIELDS: dict[str, Any] = {
+        "smartDetectSnapshotFullFoV": "",
+        "smartDetectSnapshotFullFoVHeight": 0,
+        "smartDetectSnapshotFullFoVWidth": 0,
+        "smartDetectSnapshots": [],
+    }
+
+    # Colours the real cameras draw each class in.
+    BOX_COLORS = {"person": "red", "vehicle": "cyan", "animal": "white"}
+
     def build_smart_descriptor(
         self,
         object_type: str,
@@ -425,21 +667,33 @@ class UnifiCamBase(metaclass=ABCMeta):
         zones: Optional[list] = None,
     ) -> dict[str, Any]:
         # Shape per Protect 7.x's smartDetectObjectsTransformMessage
-        # schema; coord is 0-1000 [x, y, w, h]. tracker_id must be
+        # schema, field for field what a real G5's frames carry (read from ds's
+        # payloads.jsonl); coord is 0-1000 [x, y, w, h]. tracker_id must be
         # STABLE per physical object across reports or the UI stacks a
         # new box per update instead of moving one.
+        now_ms = int(round(time.time() * 1000))
+        seen = self.__dict__.setdefault("_first_shown_ms", {})
+        if len(seen) > 256:
+            seen.clear()
+        first_shown = seen.setdefault(int(tracker_id), now_ms)
         return {
             "trackerID": int(tracker_id),
-            "name": object_type,
+            "name": "",
             "confidenceLevel": int(round(confidence * 100)),
             "coord": [int(c) for c in coord],
             "objectType": object_type,
             "zones": [int(z) for z in zones] if zones else [1],
             "lines": [],
             "loiterZones": [],
+            "intelligenceZones": [],
+            "secondLensZones": [],
             "stationary": False,
-            "attributes": {},
-            "coord3d": [],
+            "attributes": None,
+            "coord3d": [-1, -1],
+            "boxColor": self.BOX_COLORS.get(object_type, "white"),
+            "firstShownTimeMs": first_shown,
+            "idleSinceTimeMs": 0,
+            "tag": "",
         }
 
     async def trigger_motion_update(self, descriptors: list) -> None:
@@ -462,13 +716,16 @@ class UnifiCamBase(metaclass=ABCMeta):
             "eventType": "motion",
             "objectTypes": sorted({d["objectType"] for d in descriptors}),
             "zonesStatus": {
-                str(z): {"status": "moving"} for d in descriptors for z in d["zones"]
+                str(z): {"level": self.SMART_ZONE_LEVEL, "status": "moving"}
+                for d in descriptors
+                for z in d["zones"]
             }
-            or {"1": {"status": "moving"}},
+            or {"1": {"level": self.SMART_ZONE_LEVEL, "status": "moving"}},
             "displayTimeoutMSec": self.SMART_DISPLAY_TIMEOUT_MS,
             "descriptors": descriptors,
+            **self.EMPTY_SNAPSHOT_FIELDS,
         }
-        await self.send(self.gen_response("EventSmartDetect", payload=payload))
+        await self.send(self.gen_event("EventSmartDetect", payload))
 
     async def trigger_motion_stop(self) -> None:
         motion_start_ts = self._motion_event_ts
@@ -493,16 +750,23 @@ class UnifiCamBase(metaclass=ABCMeta):
                     {
                         "objectTypes": [motion_object_type.value],
                         "edgeType": "leave",
-                        "zonesStatus": {"1": {"status": "leave"}},
+                        "zonesStatus": {
+                            "1": {"level": self.SMART_ZONE_LEVEL, "status": "leave"}
+                        },
                         "smartDetectSnapshot": "motionsnap.jpg",
                         "displayTimeoutMSec": self.SMART_DISPLAY_TIMEOUT_MS,
                         "descriptors": [],
                     }
                 )
+                payload.update(self._stage_full_fov())
                 if self._smart_snapshots:
                     payload["smartDetectSnapshots"] = list(self._smart_snapshots)
                     payload["trackerIDAttrMap"] = {
-                        str(entry["trackerID"]): {} for entry in self._smart_snapshots
+                        str(entry["trackerID"]): {
+                            "objectType": entry["smartDetectSnapshotType"],
+                            "zone": [1],
+                        }
+                        for entry in self._smart_snapshots
                     }
                     self.logger.info(
                         "Announcing object crops: "
@@ -520,9 +784,9 @@ class UnifiCamBase(metaclass=ABCMeta):
                 else ""
             )
             await self.send(
-                self.gen_response(
+                self.gen_event(
                     "EventSmartDetect" if motion_object_type else "EventAnalytics",
-                    payload=payload,
+                    payload,
                 ),
             )
             self._motion_event_id += 1
@@ -544,6 +808,32 @@ class UnifiCamBase(metaclass=ABCMeta):
     # this only needs to outlive a slow NVR, not a long event: crops
     # belonging to the event still in progress are never pruned.
     CROP_RETENTION_SEC = 600
+
+    def _stage_full_fov(self) -> dict[str, Any]:
+        """Announce the event's full frame like real cameras do.
+
+        Their leave frame names a full-field-of-view jpeg plus its size; ds then
+        asks for it and stores thumbnailFullfovId. Without it only the per-object
+        crop exists and the event card has no wide view.
+        """
+        src = self._motion_snapshot
+        if not src or not src.exists():
+            return {}
+        fname = f"fullfov_{self._motion_event_id}.jpg"
+        # Same pruned directory as the per-object crops, not the temp root.
+        dst = Path(getattr(self, "snapshot_dir", None) or src.parent, fname)
+        try:
+            shutil.copyfile(src, dst)
+        except OSError:
+            return {}
+        self._smart_snapshot_files[fname] = dst
+        self.prune_stale_crops()
+        width, height = jpeg_size(dst) or (0, 0)
+        return {
+            "smartDetectSnapshotFullFoV": fname,
+            "smartDetectSnapshotFullFoVHeight": height,
+            "smartDetectSnapshotFullFoVWidth": width,
+        }
 
     def prune_stale_crops(self) -> None:
         cutoff = time.time() - self.CROP_RETENTION_SEC
@@ -571,11 +861,18 @@ class UnifiCamBase(metaclass=ABCMeta):
             self._motion_snapshot_file = None
         self._motion_snapshot = None
 
+    # A camera dropping off Wi-Fi used to hang a snapshot fetch for aiohttp's
+    # default 5 minutes, and the timeout then escaped as a non-ClientError.
+    SNAPSHOT_FETCH_TIMEOUT = aiohttp.ClientTimeout(total=10, sock_connect=5)
+    SNAPSHOT_UPLOAD_TIMEOUT = aiohttp.ClientTimeout(total=30, sock_connect=5)
+
     async def fetch_to_file(self, url: str, dst: Path) -> bool:
         try:
             # ssl=False: snapshot URLs point at LAN cameras with self-signed
             # certs (this Reolink is HTTPS-only), which fail verification.
-            async with aiohttp.request("GET", url, ssl=False) as resp:
+            async with aiohttp.request(
+                "GET", url, ssl=False, timeout=self.SNAPSHOT_FETCH_TIMEOUT
+            ) as resp:
                 if resp.status != 200:
                     self.logger.error(f"Error retrieving file {resp.status}")
                     return False
@@ -588,7 +885,12 @@ class UnifiCamBase(metaclass=ABCMeta):
                     f.write(body)
                 os.replace(tmp, dst)
                 return True
-        except aiohttp.ClientError:
+        except (aiohttp.ClientError, asyncio.TimeoutError, OSError) as e:
+            # The exception text can carry the URL, and with it the password.
+            self.logger.warning(
+                f"Snapshot fetch failed: {type(e).__name__}"
+                f" ({self.redact_secrets(str(e))})"
+            )
             return False
 
     # Protocol implementation
@@ -637,7 +939,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     "lensmodel": self.args.model,
                     "cameraName": self.args.name,
                     "isGen5s": True,
-                    "isDoorbellSeries": False,
+                    "isDoorbellSeries": bool(getattr(self.args, "doorbell", False)),
                 }
             )
         await self.send(self.gen_response("ubnt_avclient_hello", payload=payload))
@@ -757,6 +1059,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         )
 
     async def process_video_settings(self, msg: AVClientRequest) -> AVClientResponse:
+        # Advertise the encoded output, which may differ from the camera source.
+        transcode_hi = self._hw_transcoding("video1")
+        hi_codec = "h264" if transcode_hi else self.args.hi_codec
+        hi_width = self.args.transcode_width if transcode_hi else self.args.hi_width
+        hi_height = self.args.transcode_height if transcode_hi else self.args.hi_height
+        lo_codec = "h265" if self._lo_h265_transcoding("video2") else self.args.lo_codec
         vid_dst = {
             "video1": ["file:///dev/null"],
             "video2": ["file:///dev/null"],
@@ -810,7 +1118,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                     "hdrMode": 0,
                     "lowDelay": False,
                     "videoMode": "default",
-                    "videoCodec": self.args.hi_codec,
+                    "videoCodec": hi_codec,
                     "mjpg": {
                         "avSerializer": {
                             "destinations": [
@@ -873,7 +1181,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "enabled": True,
                         "fps": self.args.hi_fps,
                         "gopModel": 0,
-                        "height": self.args.hi_height,
+                        "height": hi_height,
                         "horizontalFlip": False,
                         "isCbr": False,
                         "maxFps": 30,
@@ -884,7 +1192,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "sourceId": 0,
                         "streamId": 1,
                         "streamOrdinal": 0,
-                        "type": self.args.hi_codec,
+                        "type": hi_codec,
                         "validBitrateRangeMax": 16000000,
                         "validBitrateRangeMin": 32000,
                         "validFpsValues": [
@@ -907,7 +1215,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             30,
                         ],
                         "verticalFlip": False,
-                        "width": self.args.hi_width,
+                        "width": hi_width,
                     },
                     "video2": {
                         "M": 1,
@@ -946,7 +1254,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "sourceId": 1,
                         "streamId": 2,
                         "streamOrdinal": 1,
-                        "type": self.args.lo_codec,
+                        "type": lo_codec,
                         "validBitrateRangeMax": 1500000,
                         "validBitrateRangeMin": 32000,
                         "validFpsValues": [
@@ -1008,7 +1316,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                         "sourceId": 2,
                         "streamId": 4,
                         "streamOrdinal": 2,
-                        "type": self.args.lo_codec,
+                        "type": lo_codec,
                         "validBitrateRangeMax": 750000,
                         "validBitrateRangeMin": 32000,
                         "validFpsValues": [
@@ -1306,22 +1614,35 @@ class UnifiCamBase(metaclass=ABCMeta):
             path = self._motion_snapshot
         else:
             path = await self.get_snapshot()
+            # The capture process this starts (or restarts) takes a moment to produce
+            # its first frame. A request landing right after adoption/reconnect, before
+            # that frame exists, used to fail outright with no retry; wait briefly for it
+            # instead, bounded well under Protect's own request timeout.
+            if path and not path.exists():
+                for _ in range(25):  # ~5s at 0.2s steps
+                    await asyncio.sleep(0.2)
+                    if path.exists():
+                        break
 
         if path and path.exists():
-            async with aiohttp.ClientSession() as session:
-                files = {"payload": open(path, "rb")}
-                files.update(msg["payload"].get("formFields", {}))
+            async with aiohttp.ClientSession(
+                timeout=self.SNAPSHOT_UPLOAD_TIMEOUT
+            ) as session:
                 try:
-                    await session.post(
-                        msg["payload"]["uri"],
-                        data=files,
-                        ssl=self._ssl_context,
-                    )
+                    with open(path, "rb") as payload_file:
+                        files = {"payload": payload_file}
+                        files.update(msg["payload"].get("formFields", {}))
+                        async with session.post(
+                            msg["payload"]["uri"],
+                            data=files,
+                            ssl=self._ssl_context,
+                        ):
+                            pass
                     self.logger.info(
                         f"Uploaded {snapshot_type}"
                         f" ({path.stat().st_size} bytes) from {path}"
                     )
-                except aiohttp.ClientError:
+                except (aiohttp.ClientError, asyncio.TimeoutError, OSError):
                     self.logger.exception("Failed to upload snapshot")
         else:
             self.logger.warning(
@@ -1341,6 +1662,15 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "features": {},
             },
         )
+
+    def gen_event(self, name: str, payload: dict[str, Any]) -> AVClientResponse:
+        # ds parses event envelopes with a typed schema that also requires timeStamp,
+        # as an RFC 3339 string (an integer is rejected); other message kinds are not
+        # parsed that way.
+        msg = self.gen_response(name, payload=payload)
+        stamp = datetime.now(timezone.utc).isoformat(timespec="milliseconds")
+        msg["timeStamp"] = stamp.replace("+00:00", "Z")  # type: ignore[typeddict-unknown-key]
+        return msg
 
     def gen_response(
         self, name: str, response_to: int = 0, payload: Optional[dict[str, Any]] = None
@@ -1381,6 +1711,10 @@ class UnifiCamBase(metaclass=ABCMeta):
                 "UpdateFirmwareRequest",
                 "Reboot",
                 "ubnt_avclient_hello",
+                "ContinuousMove",
+                "Preset",
+                "Home",
+                "TurnOnColorNightVision",
             ]
         ):
             return False
@@ -1405,6 +1739,8 @@ class UnifiCamBase(metaclass=ABCMeta):
             res = await self.process_network_status(m)
         elif fn == "AnalyticsTest":
             res = self.gen_response("AnalyticsTest", response_to=m["messageId"])
+        elif fn == "ChangeTalkbackSettings":
+            res = await self.process_talkback_settings(m)
         elif fn == "ChangeSoundLedSettings":
             res = await self.process_sound_led_settings(m)
         elif fn == "ChangeIspSettings":
@@ -1412,7 +1748,11 @@ class UnifiCamBase(metaclass=ABCMeta):
         elif fn == "ChangeAnalyticsSettings":
             res = await self.process_analytics_settings(m)
         elif fn == "GetRequest":
-            res = await self.process_snapshot_request(m)
+            # Answered off the message loop: fetching from a struggling camera
+            # and uploading take seconds, and every other Protect request
+            # (time sync, settings) used to wait behind them.
+            self._spawn_request(self._answer_snapshot_request(m))
+            return False
         elif fn == "UpdateUsernamePassword":
             res = self.gen_response(
                 "UpdateUsernamePassword", response_to=m["messageId"]
@@ -1423,7 +1763,26 @@ class UnifiCamBase(metaclass=ABCMeta):
             await self.process_upgrade(m)
             return True
         elif fn == "Reboot":
+            await self.reboot_camera()
             return True
+        elif fn == "ContinuousMove":
+            payload = m.get("payload") or {}
+            await self.continuous_move(
+                payload.get("x", 0), payload.get("y", 0), payload.get("z", 0)
+            )
+        elif fn == "GetCurrentPosition":
+            position = await self.ptz_position()
+            if position is not None:
+                res = self.gen_response(
+                    fn, response_to=m["messageId"], payload=position
+                )
+        elif fn == "TurnOnColorNightVision":
+            payload = m.get("payload") or {}
+            self.logger.info(f"Spotlight request: {json.dumps(payload)}")
+            await self.spotlight(int(payload.get("spotlightDuration") or 0))
+        elif fn in ("Preset", "Home"):
+            self.logger.info(f"PTZ {fn} message: {json.dumps(m.get('payload') or {})}")
+            await self.ptz_preset({"function": fn, **(m.get("payload") or {})})
 
         if res is None and m.get("responseExpected"):
             # Protect 7.x sends many settings requests (talkback, clarity
@@ -1439,6 +1798,82 @@ class UnifiCamBase(metaclass=ABCMeta):
             await self.send(res)
 
         return False
+
+    def _spawn_request(self, coro) -> asyncio.Task:
+        tasks = self.__dict__.setdefault("_request_tasks", set())
+        task = asyncio.create_task(coro)
+        tasks.add(task)  # keep a reference until it finishes
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def _answer_snapshot_request(self, m: AVClientRequest) -> None:
+        try:
+            res = await self.process_snapshot_request(m)
+            if res is not None:
+                await self.send(res)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger.exception("Snapshot request failed")
+
+    def _cancel_request_tasks(self) -> None:
+        for task in list(self.__dict__.get("_request_tasks", ())):
+            task.cancel()
+
+    async def process_talkback_settings(self, m: dict[str, Any]) -> AVClientResponse:
+        payload = m.get("payload") or {}
+        self.logger.info(f"ChangeTalkbackSettings payload: {json.dumps(payload)}")
+        if getattr(self.args, "speaker", False):
+            port = int(payload.get("bindPort") or 7004)
+            await self._start_talkback_listener(port)
+        return self.gen_response(
+            "ChangeTalkbackSettings", response_to=m["messageId"], payload=payload
+        )
+
+    async def _start_talkback_listener(self, port: int) -> None:
+        if getattr(self, "_talkback_transport", None):
+            return
+        logger = self.logger
+        bridge = None
+        if getattr(self.args, "talkback_bridge", False) and getattr(
+            self.args, "reolink_ai_host", None
+        ):
+            from unifi.talkback import TalkbackBridge
+
+            bridge = TalkbackBridge(
+                f"rtsp://{self.args.reolink_ai_host}:554/h264Preview_01_main",
+                self.args.reolink_ai_user,
+                self.args.reolink_ai_password,
+                logger,
+            )
+            logger.info("Talkback bridge enabled (AAC -> G.711 -> ONVIF backchannel)")
+
+        class _Probe(asyncio.DatagramProtocol):
+            count = 0
+
+            def datagram_received(self, data: bytes, addr) -> None:
+                _Probe.count += 1
+                if bridge:
+                    bridge.feed(data)
+                if _Probe.count <= 20 or _Probe.count % 200 == 0:
+                    hdr = ""
+                    if len(data) >= 12:
+                        hdr = (
+                            f" rtp v={data[0] >> 6} pt={data[1] & 0x7F}"
+                            f" seq={int.from_bytes(data[2:4], 'big')}"
+                            f" ts={int.from_bytes(data[4:8], 'big')}"
+                            f" ssrc={int.from_bytes(data[8:12], 'big'):08x}"
+                        )
+                    logger.info(
+                        f"talkback udp #{_Probe.count} from {addr[0]}:{addr[1]}"
+                        f" len={len(data)}{hdr} head={data[:16].hex()}"
+                    )
+
+        loop = asyncio.get_running_loop()
+        self._talkback_transport, _ = await loop.create_datagram_endpoint(
+            _Probe, local_addr=("0.0.0.0", port)
+        )
+        self.logger.info(f"Talkback UDP listener on 0.0.0.0:{port}")
 
     def get_base_ffmpeg_args(self, stream_index: str = "") -> str:
         # No -use_wallclock_as_timestamps: stamping packets with network
@@ -1462,17 +1897,23 @@ class UnifiCamBase(metaclass=ABCMeta):
         except subprocess.CalledProcessError:
             self.logger.exception("Could not check for ffmpeg options")
 
-        # Pre-input (decode) slot: hardware-decode HEVC on the iGPU via QSV so
-        # frames stay on the GPU for vpp_qsv + h264_qsv (no CPU round-trip).
+        # Keep decoded frames on the selected GPU for scaling and encoding.
         prefix = ""
         if self._hw_transcoding(stream_index) or self._lo_h265_transcoding(
             stream_index
         ):
-            # NOTE: do NOT pin `-c:v hevc_qsv` here. The hi source is HEVC, but
-            # if this stream ever carries H.264 (e.g. a sub-stream fallback),
-            # forcing the HEVC decoder fails with "Function not implemented".
-            # `-hwaccel qsv` alone lets ffmpeg pick the right QSV decoder.
-            prefix = f"-hwaccel qsv -qsv_device {self.args.hw_device} "
+            device = shlex.quote(self.args.hw_device)
+            if self._hw_backend() == "vaapi":
+                # Automatic decoder threading can exhaust FFmpeg 6 VA-API
+                # surface pools on workers with many CPUs. Decode on the GPU
+                # with one submission thread; QSV/passthrough stay unchanged.
+                prefix = (
+                    f"-hwaccel vaapi -hwaccel_device {device}"
+                    " -hwaccel_output_format vaapi -threads 1 "
+                )
+            else:
+                # Let ffmpeg select the decoder for either H.264 or HEVC.
+                prefix = f"-hwaccel qsv -qsv_device {device} "
         return prefix + " ".join(base_args)
 
     async def start_video_stream(
@@ -1492,7 +1933,7 @@ class UnifiCamBase(metaclass=ABCMeta):
             cmd = (
                 "ffmpeg -nostdin -loglevel error -y"
                 f" {self.get_base_ffmpeg_args(stream_index)} -rtsp_transport"
-                f' {self.args.rtsp_transport} -i "{source}"'
+                f" {self.args.rtsp_transport} -i {shlex.quote(source)}"
                 f" {self.get_extra_ffmpeg_args(stream_index)} -metadata"
                 f" streamName={stream_name} -f flv - | {hevc_filter}{sys.executable} -m"
                 " unifi.clock_sync"
@@ -1503,18 +1944,22 @@ class UnifiCamBase(metaclass=ABCMeta):
             if is_dead:
                 self.logger.warn(f"Previous ffmpeg process for {stream_index} died.")
 
-            self.logger.info(
-                f"Spawning ffmpeg for {stream_index} ({stream_name}):"
-                f" {self.redact_secrets(cmd)}"
-            )
+            # Shell quoting can split a password across quote transitions, so
+            # redacting the assembled command cannot reliably hide credentials.
+            self.logger.info(f"Spawning ffmpeg for {stream_index} ({stream_name})")
             # start_new_session: the whole pipeline (ffmpeg, the
             # hevc_flv/clock_sync helpers, nc) shares one process
             # group so stop_video_stream can tear it down as a unit
             # instead of orphaning ffmpeg when only the shell is killed.
             self._stream_meta[stream_index] = (stream_name, destination)
+            driver = getattr(self.args, "vaapi_driver", None)
+            environment = os.environ.copy()
+            if driver:
+                environment["LIBVA_DRIVER_NAME"] = driver
             self._ffmpeg_handles[stream_index] = subprocess.Popen(
                 cmd,
                 stdout=subprocess.DEVNULL,
+                env=environment,
                 shell=True,
                 start_new_session=True,
             )
@@ -1538,6 +1983,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         if self._watchdog_task is not None:
             self._watchdog_task.cancel()
             self._watchdog_task = None
+        self._cancel_request_tasks()
         await self.trigger_motion_stop()
         self.close_streams()
         self._remove_scratch_files()

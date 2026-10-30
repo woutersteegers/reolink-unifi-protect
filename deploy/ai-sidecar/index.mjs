@@ -10,6 +10,16 @@ const USER = process.env.CAM_USER || "admin";
 const PASS = process.env.CAM_PASS;
 const SINK = process.env.SINK_URL;
 const INTERVAL_MS = Number(process.env.POST_INTERVAL_MS || 400);
+// Which Baichuan stream to read the boxes from. Measured on Reolink doorbells: the MAIN
+// stream carries them in every frame's extended header and the SUB stream carries none
+// (an 8-byte counter only), so doorbells need PROFILE=main. The older floodlight used sub.
+const PROFILE = process.env.PROFILE || "sub";
+// On-demand mode: when STATE_URL is set, the stream (about 4.5 Mbit/s for a doorbell's
+// main stream) is only open while the proxy reports a detection in progress, plus a short
+// linger so the proxy sees the boxes disappear. Without it the stream is always on.
+const STATE_URL = process.env.STATE_URL || "";
+const STATE_POLL_MS = Number(process.env.STATE_POLL_MS || 400);
+const LINGER_MS = Number(process.env.LINGER_MS || 4000);
 
 const LABELS = {
   person: "person",
@@ -123,7 +133,8 @@ function mapNodelinkBoxes(event) {
 
 // Steady heartbeat (empty reports included) so the proxy can time out
 // an event when boxes disappear without needing its own poller.
-setInterval(async () => {
+let posting = !STATE_URL;
+async function postOnce() {
   try {
     await fetch(SINK, {
       method: "POST",
@@ -133,7 +144,19 @@ setInterval(async () => {
   } catch (e) {
     console.error("sink post failed:", e.message);
   }
+}
+setInterval(() => {
+  if (posting) void postOnce();
 }, INTERVAL_MS);
+
+async function detectionActive() {
+  try {
+    const r = await fetch(STATE_URL);
+    return (await r.json()).active === true;
+  } catch {
+    return false;
+  }
+}
 
 async function session() {
   const api = new ReolinkBaichuanApi({
@@ -142,20 +165,45 @@ async function session() {
     password: PASS,
     logger: console,
   });
+  const handler = (event) => {
+    latest = mapEvent(event);
+  };
+  const opts = { channel: 0, profile: PROFILE };
+  let streaming = false;
   try {
     await api.login();
-    console.log("baichuan login OK; subscribing to detection boxes");
-    await api.onObjectDetections(
-      (event) => {
-        latest = mapEvent(event);
-      },
-      { channel: 0, profile: "sub" },
-    );
-    // Liveness: detection events only flow while objects are visible,
-    // so probe the connection instead of waiting on events.
+    console.log(`baichuan login OK; profile=${PROFILE} on-demand=${Boolean(STATE_URL)}`);
+    if (!STATE_URL) {
+      await api.onObjectDetections(handler, opts);
+      streaming = true;
+    }
+    let lastActive = 0;
+    let lastPing = Date.now();
     for (;;) {
-      await new Promise((r) => setTimeout(r, 30000));
-      await api.ping();
+      if (STATE_URL) {
+        const now = Date.now();
+        const active = await detectionActive();
+        if (active) lastActive = now;
+        if (active && !streaming) {
+          await api.onObjectDetections(handler, opts);
+          streaming = true;
+          posting = true;
+          console.log("stream on");
+        } else if (!active && streaming && now - lastActive > LINGER_MS) {
+          await api.offObjectDetections(handler, opts);
+          streaming = false;
+          latest = [];
+          await postOnce(); // final empty report so the proxy can end the event
+          posting = false;
+          console.log("stream off");
+        }
+      }
+      // Liveness: probe the connection instead of waiting on events.
+      if (Date.now() - lastPing > 30000) {
+        await api.ping();
+        lastPing = Date.now();
+      }
+      await new Promise((r) => setTimeout(r, STATE_URL ? STATE_POLL_MS : 1000));
     }
   } finally {
     try {

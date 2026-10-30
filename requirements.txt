@@ -8,6 +8,7 @@ hikvisionapi>=0.3.2
 semver
 packaging
 uiprotect
-reolinkapi
+reolinkapi>=0.4.1
 websockets>=9.0.1,<13
 xmltodict
+reolink-aio==0.21.18

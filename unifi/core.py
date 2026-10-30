@@ -27,7 +27,9 @@ class Core(object):
         self.ssl_context.load_cert_chain(args.cert, args.cert)
 
     def _headers(self) -> dict:
-        headers = {"camera-mac": self.mac}
+        # Protect stores MACs as 12 uppercase hex digits, and ds looks the camera up by
+        # exactly this header ("Camera 02:4A:... not found" with colons).
+        headers = {"camera-mac": self.mac.replace(":", "").upper()}
         if getattr(self.args, "sysid", None):
             # Real cameras also identify on the WSS handshake. camera-model
             # must be the HEX SYSID (e.g. 0xa598) — sending the model NAME

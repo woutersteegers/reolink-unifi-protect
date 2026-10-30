@@ -1,0 +1,42 @@
+name: Container check
+on:
+  pull_request:
+    paths:
+      - Dockerfile.vaapi
+      - requirements.txt
+      - pyproject.toml
+      - unifi/**
+      - deploy/ai-sidecar/**
+      - scripts/vaapi-smoke-test.sh
+      - .github/workflows/container-check.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: container-check-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v5
+      - name: Build the amd64 runtime without publishing
+        run: docker build --pull -f Dockerfile.vaapi -t unifi-cam-proxy:check .
+      - name: Check Python, Node, sidecar, and GPU userspace
+        run: |
+          docker run --rm --entrypoint /bin/sh unifi-cam-proxy:check -ec '
+            python3 -c "from unifi.cams.rtsp import RTSPCam"
+            python3 -m pip check
+            node --version
+            node --check /opt/ai-sidecar/index.mjs
+            cd /opt/ai-sidecar
+            node --input-type=module -e "await import(\"@apocaliss92/nodelink-js\")"
+            test -f /usr/lib/x86_64-linux-gnu/dri/radeonsi_drv_video.so
+            ffmpeg -hide_banner -encoders 2>/dev/null | grep -q h264_vaapi
+            ffmpeg -hide_banner -encoders 2>/dev/null | grep -q hevc_vaapi
+            test -z "${LIBVA_DRIVER_NAME:-}"
+          '

@@ -1,4 +1,6 @@
 *.pyc
+.git
+.github
 build
 dist
 docs

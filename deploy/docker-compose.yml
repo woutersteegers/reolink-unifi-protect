@@ -107,11 +107,11 @@ services:
       # still burying the flicker.
       - --ai-confidence-overrides
       - "animal=0.6"
-      # Audio passthrough (AAC-LC 16k mono, the real UniFi wire format).
+      # Copy video and re-encode audio for FFmpeg 7 FLV compatibility.
       # Timestamps come from the camera's RTP clock (wallclock stamping
       # removed in base.py) so the samples line up gaplessly.
       - --ffmpeg-args
-      - "-c:v copy -c:a copy"
+      - "-c:v copy -ar 16000 -ac 1 -c:a aac -b:a 32k"
       - --hi-codec
       - h265
       - --hi-width
@@ -123,6 +123,8 @@ services:
       - --lo-codec
       - h265
       - --lo-h265-transcode
+      - --lo-audio-args
+      - "-ar 16000 -ac 1 -c:a aac -b:a 32k"
       - --lo-width
       - "1920"
       - --lo-height
