@@ -25,6 +25,7 @@ import packaging
 import websockets
 
 from unifi.core import RetryableError
+from unifi.hw_check import check_hw
 
 AVClientRequest = AVClientResponse = dict[str, Any]
 
@@ -232,6 +233,9 @@ class UnifiCamBase(metaclass=ABCMeta):
 
     async def _run(self, ws) -> None:
         self._session = ws
+        if not getattr(self, "_hw_checked", False):
+            self._hw_checked = True
+            await self._check_hw()
         await self.init_adoption()
         if self._watchdog_task is None or self._watchdog_task.done():
             self._watchdog_task = asyncio.create_task(self._watch_streams())
@@ -314,6 +318,24 @@ class UnifiCamBase(metaclass=ABCMeta):
 
     def _hw_backend(self) -> str:
         return getattr(self.args, "hw_backend", "qsv")
+
+    async def _check_hw(self) -> None:
+        # Once per process: a wrong or unpinned libva driver otherwise shows
+        # up only as transcoded channels respawn-looping. Logged, not fatal:
+        # passthrough channels still record without the iGPU.
+        if not (
+            getattr(self.args, "hw_transcode", False)
+            or getattr(self.args, "lo_h265_transcode", False)
+        ):
+            return
+        pinned = getattr(self.args, "vaapi_driver", None) or os.environ.get(
+            "LIBVA_DRIVER_NAME"
+        )
+        ok, detail = await check_hw(self.args.hw_device, self._hw_backend(), pinned)
+        if ok:
+            self.logger.info(f"iGPU check passed: {detail}")
+        else:
+            self.logger.error(f"iGPU check FAILED: {detail}")
 
     def _emits_h265(self, stream_index: str = "") -> bool:
         # Channels whose FLV output carries HEVC and therefore needs the
