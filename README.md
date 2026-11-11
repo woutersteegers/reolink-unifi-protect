@@ -1,7 +1,9 @@
 # Reolink → UniFi Protect Bridge
 
-A fork of [keshavdv/unifi-cam-proxy](https://github.com/keshavdv/unifi-cam-proxy)
-that gets a non-Ubiquiti camera into UniFi Protect as a *first-class* citizen:
+Gets a non-Ubiquiti camera into UniFi Protect as a *first-class* citizen.
+It started from [keshavdv/unifi-cam-proxy](https://github.com/keshavdv/unifi-cam-proxy),
+which provides the Protect adoption and streaming groundwork; the Reolink and
+modern-Protect work below was built on top of it here:
 
 - **Native H.265 passthrough** — the camera's 5K HEVC main stream is fed to
   Protect untouched (`-c:v copy`), rewritten on the fly into UniFi's
@@ -30,21 +32,26 @@ Reolink with on-board detection.
 
 ## Contributors
 
-This fork is maintained and developed by:
-
-- [Andy Drag (@andy83-projects)](https://github.com/andy83-projects) — fork
-  maintainer, lab integration and validation, and AMD VA-API support.
+- [Wouter Steegers (@woutersteegers)](https://github.com/woutersteegers) —
+  maintainer; the H.265 passthrough, camera identity emulation, Baichuan AI
+  detections, Intel QSV transcoding and stream watchdog.
+- [Andy Drag (@andy83-projects)](https://github.com/andy83-projects) — from
+  [the andy83-projects fork](https://github.com/andy83-projects/reolink-unifi-protect):
+  doorbell, two-way audio, PTZ, spotlight, the Protect 7.3 event schema
+  fixes and AMD VA-API support, merged back in
+  [#9](https://github.com/woutersteegers/reolink-unifi-protect/pull/9).
 - [@jikdoc](https://github.com/jikdoc) — snapshot, push-event and credential
   fixes, the Debian runtime upgrade, and audio/scaling controls
-  ([PRs #1–#6](https://github.com/andy83-projects/reolink-unifi-protect/pulls?q=is%3Apr+author%3Ajikdoc+is%3Amerged)).
+  ([PRs #1–#6](https://github.com/andy83-projects/reolink-unifi-protect/pulls?q=is%3Apr+author%3Ajikdoc+is%3Amerged)
+  on andy83's fork).
 
 The upstream projects and their contributors are acknowledged in [Credits](#credits).
 The full commit-based contributor list is available in
-[GitHub Contributors](https://github.com/andy83-projects/reolink-unifi-protect/graphs/contributors).
+[GitHub Contributors](https://github.com/woutersteegers/reolink-unifi-protect/graphs/contributors).
 
-## What the andy83-projects fork adds
+## Features contributed from the andy83-projects fork
 
-Everything below was added on top of the upstream project and is covered by the unit tests in `tests/`.
+Everything below came in with #9 and is covered by the unit tests in `tests/`.
 Each feature is opt-in by flag, so a camera that does not use it behaves exactly as before. The complete
 list of options is in [docs/FLAGS.md](docs/FLAGS.md).
 
@@ -155,7 +162,7 @@ detection zone and enable the detection types you want.
 change any of those flags later, remove the camera in Protect, put a fresh
 adoption token in `.env`, and `docker compose up -d --force-recreate`.
 
-## Notable flags added by this fork
+## Notable flags added here
 
 The full, generated list is in [docs/FLAGS.md](docs/FLAGS.md); the main ones are below.
 
@@ -225,15 +232,12 @@ smart-detection bridge is currently wired into the `rtsp` source.
 
 ## Credits
 
-This repository is a fork of
-[woutersteegers/reolink-unifi-protect](https://github.com/woutersteegers/reolink-unifi-protect)
-(itself a fork of keshavdv/unifi-cam-proxy). All of the camera emulation, codec
-and Baichuan work that this builds on is theirs; please star and credit the
-originals. The doorbell, push-event and talkback additions were written by
-andy83-projects together with Claude (Anthropic).
+The camera emulation, codec and Baichuan work was written for this repository.
+The doorbell, push-event and talkback additions were written by
+andy83-projects together with Claude (Anthropic) and merged in from that fork.
 
 - [keshavdv/unifi-cam-proxy](https://github.com/keshavdv/unifi-cam-proxy) —
-  the foundation this fork builds on (MIT).
+  the original proxy this project started from (MIT).
 - [apocaliss92/nodelink-js](https://github.com/apocaliss92/nodelink-js) —
   Baichuan protocol transport, and the detection-TLV walker our decoder
   is derived from.
