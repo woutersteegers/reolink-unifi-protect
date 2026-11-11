@@ -984,12 +984,16 @@ class UnifiCamBase(metaclass=ABCMeta):
             },
         )
 
-    # Download filenames carry the short version, e.g.
-    # .../e7fc-sav837gw-5.4.132-<uuid>.bin
-    FW_FILENAME_VERSION = re.compile(r"-(\d+\.\d+\.\d+)-[^/]*\.bin$")
+    # The push URI carries the short version as a path token, in either
+    # form seen so far:
+    #   https://<nvr>:7444/internal/update/sav837gw/uvc/firmware/5.5.31/<MAC>
+    #   https://fw-download.ubnt.com/data/uvc/e7fc-sav837gw-5.4.132-<uuid>.bin
+    FW_URI_VERSION = re.compile(r"(?:^|[/-])(\d+\.\d+\.\d+)(?=[/-]|\.bin$|$)")
     # Legacy (pre-sysid) binaries carry a plaintext long-form version at
-    # offset 4, e.g. UVC.S2L.v4.23.8.67.0eba6e3.200526.1046.
-    FW_HEADER_VERSION = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{5,49}")
+    # offset 4, e.g. UVC.S2L.v4.23.8.67.0eba6e3.200526.1046. The "v" plus
+    # dotted numbers is required: current (sav837gw) binaries open with a
+    # printable hex digest that a looser check adopted as the version.
+    FW_HEADER_VERSION = re.compile(r"[A-Za-z0-9._-]*v\d+\.\d+\.\d+[A-Za-z0-9._-]*")
 
     async def _fetch_firmware_header(self, url: str) -> bytes:
         headers = {"Range": "bytes=0-100"}
@@ -1006,10 +1010,12 @@ class UnifiCamBase(metaclass=ABCMeta):
         """
         url = msg["payload"]["uri"]
         version = None
-        m = self.FW_FILENAME_VERSION.search(urllib.parse.urlparse(url).path)
+        m = self.FW_URI_VERSION.search(urllib.parse.urlparse(url).path)
         if m:
             version = m.group(1)
-        else:
+        elif not getattr(self.args, "sysid", None):
+            # The header holds the long form, which is only right without
+            # --sysid (that mode advertises the short form).
             try:
                 raw = (await self._fetch_firmware_header(url))[4:54]
                 text = raw.split(b"\x00", 1)[0].decode("ascii")

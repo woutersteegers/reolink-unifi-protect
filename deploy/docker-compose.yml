@@ -78,10 +78,12 @@ services:
       # doesn't offer/push an upgrade to a camera that can't take one
       # (auto-update is scheduled for 03:00 on this NVR). Latest release
       # for sav837gw: https://fw-update.ui.com/api/firmware-latest?filter=eq~~platform~~sav837gw&filter=eq~~product~~uvc
-      # fw-build is still 5.4.122's: 5.4.132's header is obfuscated, so
-      # its real build string is unknown.
+      # fw-build is still 5.4.122's: newer headers are obfuscated, so the
+      # real build string is unknown. A pushed newer release is adopted
+      # in memory (process_upgrade) until the next restart; bump this
+      # to stop the nightly push.
       - --fw-version
-      - "5.4.132"
+      - "5.5.45"
       - --fw-build
       - "92ebf37.260724.1639"
       - rtsp
