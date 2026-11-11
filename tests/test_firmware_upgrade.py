@@ -37,6 +37,14 @@ def cam():
     return cam
 
 
+LEGACY = "UVC.S2L.v4.23.8.67.0eba6e3.200526.1046"
+
+
+def legacy(cam):
+    """No --sysid: long-form versions, read from the binary's header."""
+    cam.args = argparse.Namespace(fw_version=LEGACY)
+
+
 def upgrade_msg(uri):
     return {"functionName": "UpdateFirmwareRequest", "payload": {"uri": uri}}
 
@@ -52,17 +60,57 @@ async def test_version_taken_from_download_filename(cam, monkeypatch):
     assert cam.args.fw_version == "5.4.132"
 
 
-async def test_unparseable_header_keeps_current_version(cam, monkeypatch):
-    async def junk_header(uri):
-        return bytes(range(0x80, 0xB6))  # obfuscated, like sav837gw .bin
+async def test_version_taken_from_nvr_internal_path(cam, monkeypatch):
+    # The form Protect actually pushes (seen 2026-10-18 onward): served
+    # by the NVR itself, version as a path segment, camera MAC last.
+    monkeypatch.setattr(base.aiohttp, "ClientSession", NoNetwork)
+    uri = (
+        "https://192.168.1.1:7444/internal/update/sav837gw/uvc/firmware/"
+        "5.5.31/AABBCC00C129"
+    )
+    await cam.process_upgrade(upgrade_msg(uri))
+    assert cam.args.fw_version == "5.5.31"
 
-    monkeypatch.setattr(cam, "_fetch_firmware_header", junk_header)
+
+async def test_hex_digest_header_is_not_a_version(cam, monkeypatch):
+    # sav837gw binaries open with a printable hex digest; this was
+    # adopted as fwVersion on 2026-10-15..17.
+    async def hex_header(uri):
+        return b"\x00" * 4 + b"961b646b7432306f4ae2617ff17c769c94f3260ce87ac5bd05"
+
+    legacy(cam)
+    monkeypatch.setattr(cam, "_fetch_firmware_header", hex_header)
     await cam.process_upgrade(upgrade_msg("https://fw.example/firmware.bin"))
+    assert cam.args.fw_version == LEGACY
+
+
+async def test_header_never_consulted_in_short_version_mode(cam, monkeypatch):
+    # With --sysid Protect needs the SHORT form; a legacy long-form header
+    # version would be wrong even if it parsed.
+    fetched = []
+
+    async def header(uri):
+        fetched.append(uri)
+        return b"\x00" * 4 + b"UVC.S2L.v4.30.0.67.1234567.210101.0000"
+
+    monkeypatch.setattr(cam, "_fetch_firmware_header", header)
+    await cam.process_upgrade(upgrade_msg("https://fw.example/firmware.bin"))
+    assert fetched == []
     assert cam.args.fw_version == "5.4.122"
 
 
+async def test_unparseable_header_keeps_current_version(cam, monkeypatch):
+    async def junk_header(uri):
+        return bytes(range(0x80, 0xB6))  # binary garbage
+
+    legacy(cam)
+    monkeypatch.setattr(cam, "_fetch_firmware_header", junk_header)
+    await cam.process_upgrade(upgrade_msg("https://fw.example/firmware.bin"))
+    assert cam.args.fw_version == LEGACY
+
+
 async def test_legacy_plaintext_header_still_parsed(cam, monkeypatch):
-    cam.args = argparse.Namespace(fw_version="UVC.S2L.v4.23.8.67.0eba6e3.200526.1046")
+    legacy(cam)
     new = b"UVC.S2L.v4.30.0.67.1234567.210101.0000"
 
     async def header(uri):
