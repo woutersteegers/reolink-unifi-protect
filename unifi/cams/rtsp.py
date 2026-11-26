@@ -66,6 +66,11 @@ class RTSPCam(UnifiCamBase):
             help="Source(s) for up to three streams in order of descending quality",
         )
         parser.add_argument(
+            "--http-bind-address",
+            default=None,
+            help="Bind address for RTSP motion and detection HTTP listeners",
+        )
+        parser.add_argument(
             "--http-api",
             default=0,
             type=int,
@@ -336,7 +341,10 @@ class RTSPCam(UnifiCamBase):
 
             self.runner = web.AppRunner(app)
             await self.runner.setup()
-            site = web.TCPSite(self.runner, port=self.args.http_api)
+            site = web.TCPSite(
+                self.runner, host=getattr(self.args, "http_bind_address", None),
+                port=self.args.http_api
+            )
             await site.start()
 
         bundled_sidecar = bool(
@@ -352,7 +360,9 @@ class RTSPCam(UnifiCamBase):
             self.sink_runner = web.AppRunner(sink)
             await self.sink_runner.setup()
             # The bundled sidecar is in this container: keep the sink off the pod network.
-            host = "127.0.0.1" if bundled_sidecar else None
+            host = "127.0.0.1" if bundled_sidecar else getattr(
+                self.args, "http_bind_address", None
+            )
             await web.TCPSite(
                 self.sink_runner, host=host, port=self.args.ai_sink_port
             ).start()
