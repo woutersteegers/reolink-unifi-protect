@@ -32,6 +32,9 @@ class FakeHandle:
     def poll(self):
         return self._rc
 
+    def wait(self, timeout=None):
+        return self._rc
+
     def kill(self):
         self.killed = True
         self._rc = -9
@@ -177,7 +180,7 @@ def test_real_stop_kills_group_and_forgets_stream(cert, monkeypatch):
     assert "video1" not in cam._stream_meta
 
 
-def test_real_stop_falls_back_when_group_gone(cert, monkeypatch):
+def test_real_stop_tolerates_already_exited_group(cert, monkeypatch):
     args = argparse.Namespace(
         cert=str(cert),
         source=["rtsp://cam/main"],
@@ -190,12 +193,12 @@ def test_real_stop_falls_back_when_group_gone(cert, monkeypatch):
     h = FakeHandle(pid=4242)
     cam._ffmpeg_handles["video1"] = h
 
-    def boom(pid):
+    def boom(pid, sig):
         raise ProcessLookupError
 
-    monkeypatch.setattr(os, "getpgid", boom)
+    monkeypatch.setattr(os, "killpg", boom)
     cam.stop_video_stream("video1")
-    assert h.killed
+    assert not h.killed
     assert "video1" not in cam._ffmpeg_handles
 
 

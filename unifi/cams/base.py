@@ -1951,6 +1951,8 @@ class UnifiCamBase(metaclass=ABCMeta):
         is_dead = has_spawned and self._ffmpeg_handles[stream_index].poll() is not None
 
         if not has_spawned or is_dead:
+            if is_dead:
+                self.stop_video_stream(stream_index)
             source = await self.get_stream_source(stream_index)
             # ffmpeg muxes HEVC into FLV as Enhanced-RTMP hvc1 extended
             # tags, which Protect ingests but cannot decode; hevc_flv
@@ -1998,13 +2000,17 @@ class UnifiCamBase(metaclass=ABCMeta):
         if handle is None:
             return
         self.logger.info(f"Stopping stream {stream_index}")
+        self.stop_process_group(handle)
+
+    @staticmethod
+    def stop_process_group(handle: subprocess.Popen):
+        # start_new_session makes the original PID the group ID even if the
+        # shell has already exited and its pipeline members are still alive.
         try:
-            os.killpg(os.getpgid(handle.pid), signal.SIGKILL)
-        except (ProcessLookupError, PermissionError):
-            try:
-                handle.kill()
-            except ProcessLookupError:
-                pass
+            os.killpg(handle.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        handle.wait(timeout=2)
 
     async def close(self):
         self.logger.info("Cleaning up instance")
@@ -2012,9 +2018,11 @@ class UnifiCamBase(metaclass=ABCMeta):
             self._watchdog_task.cancel()
             self._watchdog_task = None
         self._cancel_request_tasks()
-        await self.trigger_motion_stop()
-        self.close_streams()
-        self._remove_scratch_files()
+        try:
+            await self.trigger_motion_stop()
+        finally:
+            self.close_streams()
+            self._remove_scratch_files()
 
     def close_streams(self):
         for stream in list(self._ffmpeg_handles):

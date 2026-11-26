@@ -99,11 +99,12 @@ class Core(object):
             try:
                 await asyncio.gather(*tasks)
             except RetryableError:
+                return True
+            finally:
                 for task in tasks:
                     if not task.done():
                         task.cancel()
-                return True
-            finally:
+                await asyncio.gather(*tasks, return_exceptions=True)
                 await self.cam.close()
 
         await connect()
