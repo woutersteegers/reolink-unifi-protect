@@ -1,6 +1,7 @@
 import argparse
 import asyncio
 import logging
+import signal
 import sys
 from shutil import which
 
@@ -187,12 +188,19 @@ async def run():
 
     cam = klass(args, logger)
     c = Core(args, cam, core_logger)
-    await c.run()
+    loop = asyncio.get_running_loop()
+    task = asyncio.current_task()
+    loop.add_signal_handler(signal.SIGTERM, task.cancel)
+    try:
+        await c.run()
+    except asyncio.CancelledError:
+        pass
+    finally:
+        loop.remove_signal_handler(signal.SIGTERM)
 
 
 def main():
-    loop = asyncio.get_event_loop()
-    loop.run_until_complete(run())
+    asyncio.run(run())
 
 
 if __name__ == "__main__":

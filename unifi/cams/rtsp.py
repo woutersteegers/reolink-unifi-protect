@@ -275,6 +275,7 @@ class RTSPCam(UnifiCamBase):
 
     def start_snapshot_stream(self) -> None:
         if not self.snapshot_stream or self.snapshot_stream.poll() is not None:
+            self._stop_snapshot_stream()
             cmd = (
                 f"ffmpeg -nostdin -y -re -rtsp_transport {self.args.rtsp_transport} "
                 f"-i {shlex.quote(self.args.source[-1])} "
@@ -284,7 +285,8 @@ class RTSPCam(UnifiCamBase):
             # Keep credential-bearing shell commands out of startup logs.
             self.logger.info("Spawning stream for snapshots")
             self.snapshot_stream = subprocess.Popen(
-                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, shell=True
+                cmd, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                shell=True, start_new_session=True
             )
 
     def _reolink_snapshots(self) -> bool:
@@ -1205,7 +1207,13 @@ class RTSPCam(UnifiCamBase):
                     )
                 await asyncio.sleep(self.args.reolink_ai_interval)
 
+    def _stop_snapshot_stream(self):
+        if self.snapshot_stream:
+            self.stop_process_group(self.snapshot_stream)
+            self.snapshot_stream = None
+
     async def close(self) -> None:
+        self._stop_snapshot_stream()
         await super().close()
         if self.runner:
             await self.runner.cleanup()
@@ -1225,9 +1233,6 @@ class RTSPCam(UnifiCamBase):
         if light is not None:
             await light.close()
             self._light = None
-
-        if self.snapshot_stream:
-            self.snapshot_stream.kill()
 
         # Empty (not remove) the scratch dir: Core reuses this instance
         # across websocket reconnects and run() writes here again.
