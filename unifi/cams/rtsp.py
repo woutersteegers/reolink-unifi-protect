@@ -37,6 +37,11 @@ class RTSPCam(UnifiCamBase):
         self.event_id = 0
         self.snapshot_dir = tempfile.mkdtemp()
         self.snapshot_stream = None
+        self.zone_motion = None
+        if getattr(args, "detect_motion", False):
+            from .zone_motion import ZoneMotion
+
+            self.zone_motion = ZoneMotion(self)
         self.runner = None
         self.sink_runner = None
         self._sink_last_ts = 0.0
@@ -64,6 +69,11 @@ class RTSPCam(UnifiCamBase):
             nargs="+",
             required=True,
             help="Source(s) for up to three streams in order of descending quality",
+        )
+        parser.add_argument(
+            "--detect-motion",
+            action="store_true",
+            help="Detect basic motion from RTSP using Protect's motion zones",
         )
         parser.add_argument(
             "--http-api",
@@ -315,6 +325,16 @@ class RTSPCam(UnifiCamBase):
             self.start_snapshot_stream()
         return img_file
 
+    async def process_smart_motion_settings(self, msg):
+        detector = getattr(self, "zone_motion", None)
+        if detector and msg["functionName"] == "ChangeSmartMotionSettings":
+            try:
+                detector.configure(msg.get("payload") or {})
+            except (AttributeError, TypeError, ValueError):
+                self.logger.warning("Ignoring invalid Protect motion settings")
+                detector.configure({})
+        return await super().process_smart_motion_settings(msg)
+
     async def run(self) -> None:
         if self.args.http_api:
             self.logger.info(f"Enabling HTTP API on port {self.args.http_api}")
@@ -366,6 +386,14 @@ class RTSPCam(UnifiCamBase):
         ):
             self._push_task = asyncio.create_task(self._push_reolink())
 
+        if getattr(self, "zone_motion", None):
+            async with asyncio.TaskGroup() as tasks:
+                tasks.create_task(self.zone_motion.run())
+                tasks.create_task(self._run_camera_events())
+        else:
+            await self._run_camera_events()
+
+    async def _run_camera_events(self):
         if self.args.reolink_ai_host and not self.args.reolink_push_ai:
             await self._poll_reolink_ai()
         elif getattr(self, "_push_task", None):

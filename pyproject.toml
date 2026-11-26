@@ -32,6 +32,7 @@ keywords = [
 
 
 [project.optional-dependencies]
+motion = ["opencv-python-headless", "numpy"]
 test = [
     "pytest",
     "pytest-asyncio",
