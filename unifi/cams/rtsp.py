@@ -14,6 +14,7 @@ import aiohttp
 from aiohttp import web
 
 from unifi.cams.base import SmartDetectObjectType, UnifiCamBase, jpeg_size
+from unifi.external_motion import MotionReporter
 from unifi.reolink_isp import ReolinkIsp
 from unifi.reolink_light import ReolinkLight
 from unifi.reolink_ptz import ReolinkPtz
@@ -39,6 +40,12 @@ class RTSPCam(UnifiCamBase):
         self.snapshot_stream = None
         self.runner = None
         self.sink_runner = None
+        self._detector_settings = {}
+        self._external_motion = MotionReporter(self)
+        self._external_motion_session = None
+        self._external_motion_lock = asyncio.Lock()
+        self._external_motion_seen = 0.0
+        self._external_motion_watch = None
         self._sink_last_ts = 0.0
         self._sink_last_boxes_ts = 0.0
         self._ai_tracks: list = []
@@ -59,6 +66,10 @@ class RTSPCam(UnifiCamBase):
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
         super().add_parser(parser)
         parser.add_argument(
+            "--external-detector", action="store_true",
+            help="Expose Protect settings on the loopback AI sink (--ai-sink-port)",
+        )
+        parser.add_argument(
             "--source",
             "-s",
             nargs="+",
@@ -70,6 +81,13 @@ class RTSPCam(UnifiCamBase):
             default=0,
             type=int,
             help="Specify a port number to enable the HTTP API (default: disabled)",
+        )
+        parser.add_argument(
+            "--detector-thumbnail-port",
+            type=int,
+            choices=range(1, 65536),
+            metavar="PORT",
+            help="Read detection frame images from a configured loopback detector port",
         )
         parser.add_argument(
             "--snapshot-url",
@@ -315,6 +333,61 @@ class RTSPCam(UnifiCamBase):
             self.start_snapshot_stream()
         return img_file
 
+    async def process_smart_motion_settings(self, msg):
+        response = await super().process_smart_motion_settings(msg)
+        if getattr(self.args, "external_detector", False):
+            self._detector_settings[msg["functionName"]] = msg.get("payload") or {}
+        return response
+
+    async def _handle_detector_settings(self, request):
+        return web.json_response(self._detector_settings)
+
+    async def _reconcile_external_motion(self, desired):
+        if self._external_motion_session is not self._session:
+            self._external_motion.started.clear()
+            self._external_motion_session = self._session
+        if self._session is None or getattr(self._session, "closed", False):
+            return
+        for zone in sorted(self._external_motion.started.keys() - desired):
+            await self._external_motion.edge("stop", zone)
+        for zone in sorted(desired - self._external_motion.started.keys()):
+            await self._external_motion.edge("start", zone)
+
+    async def _handle_external_motion(self, request):
+        data = await request.json()
+        zones = data.get("zones") if isinstance(data, dict) else None
+        if not isinstance(zones, list) or not all(isinstance(zone, str) for zone in zones):
+            raise web.HTTPBadRequest(text="zones must be a list of strings")
+        async with self._external_motion_lock:
+            self._external_motion_seen = time.monotonic()
+            motion = self._detector_settings.get("ChangeSmartMotionSettings", {})
+            configured = motion.get("zones") or {}
+            allowed = configured.keys() if isinstance(configured, dict) else ()
+            desired = set(zones).intersection(allowed) if motion.get("enable") is True else set()
+            await self._reconcile_external_motion(desired)
+        return web.Response(text="ok")
+
+    async def _expire_external_motion(self):
+        while True:
+            await asyncio.sleep(1)
+            async with self._external_motion_lock:
+                if time.monotonic() - self._external_motion_seen > 5:
+                    try:
+                        await self._reconcile_external_motion(set())
+                    except (ConnectionError, RuntimeError):
+                        self.logger.debug("External motion interrupted by reconnect")
+
+    def _external_detection_cutoff(self, zones):
+        smart = self._detector_settings.get("ChangeSmartDetectSettings", {})
+        configured = smart.get("zones") or {}
+        if not isinstance(configured, dict):
+            return 0.75
+        def cutoff(zone):
+            settings = configured.get(str(zone))
+            sensitivity = settings.get("sensitivity") if isinstance(settings, dict) else None
+            return (1000 - 9 * sensitivity) / 1000 if type(sensitivity) in (int, float) and 0 <= sensitivity <= 100 else 0.75
+        return min((cutoff(zone) for zone in zones or ()), default=0.75)
+
     async def run(self) -> None:
         if self.args.http_api:
             self.logger.info(f"Enabling HTTP API on port {self.args.http_api}")
@@ -344,18 +417,26 @@ class RTSPCam(UnifiCamBase):
         )
         if bundled_sidecar and not self.args.ai_sink_port:
             self.args.ai_sink_port = self.SIDECAR_SINK_PORT
+        external_detector = getattr(self.args, "external_detector", False)
+        if external_detector and not self.args.ai_sink_port:
+            raise ValueError("--external-detector requires --ai-sink-port")
         if self.args.ai_sink_port:
             self.logger.info(f"AI box sink listening on {self.args.ai_sink_port}")
             sink = web.Application()
             sink.add_routes([web.post("/detections", self._handle_detections)])
             sink.add_routes([web.get("/state", self._handle_sidecar_state)])
+            if external_detector:
+                sink.router.add_get("/settings", self._handle_detector_settings)
+                sink.router.add_post("/motion", self._handle_external_motion)
             self.sink_runner = web.AppRunner(sink)
             await self.sink_runner.setup()
             # The bundled sidecar is in this container: keep the sink off the pod network.
-            host = "127.0.0.1" if bundled_sidecar else None
+            host = "127.0.0.1" if bundled_sidecar or external_detector else None
             await web.TCPSite(
                 self.sink_runner, host=host, port=self.args.ai_sink_port
             ).start()
+        if external_detector:
+            self._external_motion_watch = asyncio.create_task(self._expire_external_motion())
         if bundled_sidecar:
             self._sidecar_task = asyncio.create_task(self._supervise_sidecar())
 
@@ -468,8 +549,15 @@ class RTSPCam(UnifiCamBase):
             data = await request.json()
         except Exception:
             return web.Response(status=400, text="bad json")
+        if not isinstance(data, dict):
+            return web.Response(status=400, text="expected a JSON object")
+        reference = data.get("frameReadNs")
+        if reference is not None and (type(reference) is not int or not 0 < reference < 10**20):
+            return web.Response(status=400, text="invalid frameReadNs")
         try:
-            await self._on_ai_boxes(data.get("boxes") or [])
+            await self._on_ai_boxes(
+                data.get("boxes") or [], snapshot_reference=reference
+            )
         except Exception:
             self.logger.exception("Failed to process AI box report")
         return web.Response(text="ok")
@@ -591,7 +679,10 @@ class RTSPCam(UnifiCamBase):
             self._conf_overrides = overrides
         return overrides.get(kind, self.args.ai_min_confidence)
 
-    async def _on_ai_boxes(self, boxes: list) -> None:
+    async def _on_ai_boxes(
+        self, boxes: list, *,
+        snapshot_reference: Optional[int] = None,
+    ) -> None:
         self._sink_last_ts = time.time()
         if self._enrich_only() and not self._motion_event_ts:
             return
@@ -627,7 +718,8 @@ class RTSPCam(UnifiCamBase):
             ):
                 continue
             confidence = float(box.get("confidence") or 0.8)
-            if confidence < self._min_confidence(kind):
+            external = getattr(self.args, "external_detector", False)
+            if not external and confidence < self._min_confidence(kind):
                 continue
             # Honor the zones drawn in Protect: a detection whose box
             # center sits outside every smart-detect zone (or inside an
@@ -636,6 +728,8 @@ class RTSPCam(UnifiCamBase):
                 kind, coord[0] + coord[2] / 2, coord[1] + coord[3] / 2
             )
             if zone_ids is not None and not zone_ids:
+                continue
+            if external and confidence < self._external_detection_cutoff(zone_ids):
                 continue
             descriptors.append(
                 self.build_smart_descriptor(
@@ -695,7 +789,8 @@ class RTSPCam(UnifiCamBase):
                     made.add(d["trackerID"])
                     asyncio.create_task(
                         self._make_object_crop(
-                            d["trackerID"], d["objectType"], d["coord"]
+                            d["trackerID"], d["objectType"], d["coord"],
+                            snapshot_reference=snapshot_reference,
                         )
                     )
         elif (
@@ -708,7 +803,32 @@ class RTSPCam(UnifiCamBase):
             await self.trigger_motion_stop()
             self._ai_active_lead = None
 
-    async def _make_object_crop(self, tracker_id: int, kind: str, coord: list) -> None:
+    async def _fetch_detector_frame(self, reference, destination):
+        port = getattr(self.args, "detector_thumbnail_port", None)
+        if port is None or reference is None:
+            return False
+        try:
+            async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=1)) as session:
+                url = f"http://127.0.0.1:{port}/frame/{reference}"
+                async with session.get(url, allow_redirects=False) as response:
+                    if response.status != 200 or response.content_type != "image/jpeg":
+                        return False
+                    limit = 4 * 1024 * 1024
+                    image = bytearray()
+                    async for chunk in response.content.iter_chunked(64 * 1024):
+                        image.extend(chunk)
+                        if len(image) > limit:
+                            return False
+                    if not image.startswith(b"\xff\xd8") or not image.endswith(b"\xff\xd9"):
+                        return False
+                    destination.write_bytes(image)
+                    return True
+        except (aiohttp.ClientError, TimeoutError, OSError):
+            return False
+
+    async def _make_object_crop(
+        self, tracker_id: int, kind: str, coord: list, *, snapshot_reference=None
+    ) -> None:
         """Square crop around one detection, from a fresh camera snapshot.
 
         Announced via smartDetectSnapshots at event stop; Protect fetches
@@ -718,7 +838,9 @@ class RTSPCam(UnifiCamBase):
         """
         fetched = Path(self.snapshot_dir, f"crop_src_{tracker_id}.jpg")
         try:
-            if self._http_snapshots():
+            if await self._fetch_detector_frame(snapshot_reference, fetched):
+                src = fetched
+            elif self._http_snapshots():
                 if not await self._fetch_snapshot(fetched):
                     return
                 src = fetched
@@ -1206,6 +1328,12 @@ class RTSPCam(UnifiCamBase):
                 await asyncio.sleep(self.args.reolink_ai_interval)
 
     async def close(self) -> None:
+        if self._external_motion_watch is not None:
+            self._external_motion_watch.cancel()
+            await asyncio.gather(self._external_motion_watch, return_exceptions=True)
+            self._external_motion_watch = None
+        self._external_motion.started.clear()
+        self._detector_settings.clear()
         await super().close()
         if self.runner:
             await self.runner.cleanup()
