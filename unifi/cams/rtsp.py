@@ -39,6 +39,7 @@ class RTSPCam(UnifiCamBase):
         self.snapshot_stream = None
         self.runner = None
         self.sink_runner = None
+        self._detector_settings = {}
         self._sink_last_ts = 0.0
         self._sink_last_boxes_ts = 0.0
         self._ai_tracks: list = []
@@ -58,6 +59,10 @@ class RTSPCam(UnifiCamBase):
     @classmethod
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
         super().add_parser(parser)
+        parser.add_argument(
+            "--external-detector", action="store_true",
+            help="Expose Protect settings on the loopback AI sink (--ai-sink-port)",
+        )
         parser.add_argument(
             "--source",
             "-s",
@@ -315,6 +320,15 @@ class RTSPCam(UnifiCamBase):
             self.start_snapshot_stream()
         return img_file
 
+    async def process_smart_motion_settings(self, msg):
+        response = await super().process_smart_motion_settings(msg)
+        if getattr(self.args, "external_detector", False):
+            self._detector_settings[msg["functionName"]] = msg.get("payload") or {}
+        return response
+
+    async def _handle_detector_settings(self, request):
+        return web.json_response(self._detector_settings)
+
     async def run(self) -> None:
         if self.args.http_api:
             self.logger.info(f"Enabling HTTP API on port {self.args.http_api}")
@@ -344,15 +358,20 @@ class RTSPCam(UnifiCamBase):
         )
         if bundled_sidecar and not self.args.ai_sink_port:
             self.args.ai_sink_port = self.SIDECAR_SINK_PORT
+        external_detector = getattr(self.args, "external_detector", False)
+        if external_detector and not self.args.ai_sink_port:
+            raise ValueError("--external-detector requires --ai-sink-port")
         if self.args.ai_sink_port:
             self.logger.info(f"AI box sink listening on {self.args.ai_sink_port}")
             sink = web.Application()
             sink.add_routes([web.post("/detections", self._handle_detections)])
             sink.add_routes([web.get("/state", self._handle_sidecar_state)])
+            if external_detector:
+                sink.router.add_get("/settings", self._handle_detector_settings)
             self.sink_runner = web.AppRunner(sink)
             await self.sink_runner.setup()
             # The bundled sidecar is in this container: keep the sink off the pod network.
-            host = "127.0.0.1" if bundled_sidecar else None
+            host = "127.0.0.1" if bundled_sidecar or external_detector else None
             await web.TCPSite(
                 self.sink_runner, host=host, port=self.args.ai_sink_port
             ).start()
