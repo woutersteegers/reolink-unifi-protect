@@ -468,8 +468,13 @@ class RTSPCam(UnifiCamBase):
             data = await request.json()
         except Exception:
             return web.Response(status=400, text="bad json")
+        if not isinstance(data, dict):
+            return web.Response(status=400, text="expected a JSON object")
+        stamp = data.get("frameWallMs")
+        if stamp is not None and (type(stamp) is not int or stamp <= 0):
+            return web.Response(status=400, text="frameWallMs must be epoch milliseconds")
         try:
-            await self._on_ai_boxes(data.get("boxes") or [])
+            await self._on_ai_boxes(data.get("boxes") or [], frame_wall_ms=stamp)
         except Exception:
             self.logger.exception("Failed to process AI box report")
         return web.Response(text="ok")
@@ -591,7 +596,9 @@ class RTSPCam(UnifiCamBase):
             self._conf_overrides = overrides
         return overrides.get(kind, self.args.ai_min_confidence)
 
-    async def _on_ai_boxes(self, boxes: list) -> None:
+    async def _on_ai_boxes(
+        self, boxes: list, *, frame_wall_ms: Optional[int] = None
+    ) -> None:
         self._sink_last_ts = time.time()
         if self._enrich_only() and not self._motion_event_ts:
             return
@@ -658,7 +665,7 @@ class RTSPCam(UnifiCamBase):
                 self.logger.info(f"AI boxes: {detail} — starting smart event")
                 self._ai_crops_made = set()
                 await self.trigger_motion_start(
-                    SmartDetectObjectType(lead), descriptors=descriptors
+                    SmartDetectObjectType(lead), descriptors=descriptors, frame_wall_ms=frame_wall_ms
                 )
                 self._ai_active_lead = lead
             elif (
@@ -677,13 +684,13 @@ class RTSPCam(UnifiCamBase):
                 saved_crops = list(self._smart_snapshots)
                 await self.trigger_motion_stop()
                 await self.trigger_motion_start(
-                    SmartDetectObjectType(lead), descriptors=descriptors
+                    SmartDetectObjectType(lead), descriptors=descriptors, frame_wall_ms=frame_wall_ms
                 )
                 # Carry the crops over to the retyped event.
                 self._smart_snapshots = saved_crops
                 self._ai_active_lead = lead
             else:
-                await self.trigger_motion_update(descriptors)
+                await self.trigger_motion_update(descriptors, frame_wall_ms=frame_wall_ms)
             # One square crop per tracked object, generated from a fresh
             # camera snapshot around its current box — the source of the
             # zoomed event thumbnail Protect shows (see base.py notes).
