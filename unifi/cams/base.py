@@ -1087,6 +1087,7 @@ class UnifiCamBase(metaclass=ABCMeta):
         )
 
     async def process_video_settings(self, msg: AVClientRequest) -> AVClientResponse:
+        single_channel = getattr(self.args, "single_channel", False)
         # Advertise the encoded output, which may differ from the camera source.
         transcode_hi = self._hw_transcoding("video1")
         hi_codec = "h264" if transcode_hi else self.args.hi_codec
@@ -1101,6 +1102,8 @@ class UnifiCamBase(metaclass=ABCMeta):
 
         if msg["payload"] is not None and "video" in msg["payload"]:
             for k, v in msg["payload"]["video"].items():
+                if single_channel and k != "video1":
+                    continue
                 if v:
                     if "avSerializer" in v:
                         vid_dst[k] = v["avSerializer"]["destinations"]
@@ -1120,7 +1123,7 @@ class UnifiCamBase(metaclass=ABCMeta):
                             except ValueError:
                                 pass
 
-        return self.gen_response(
+        response = self.gen_response(
             "ChangeVideoSettings",
             msg["messageId"],
             {
@@ -1373,6 +1376,11 @@ class UnifiCamBase(metaclass=ABCMeta):
                 },
             },
         )
+        if single_channel:
+            video = response["payload"]["video"]
+            video.pop("video2", None)
+            video.pop("video3", None)
+        return response
 
     async def process_device_settings(self, msg: AVClientRequest) -> AVClientResponse:
         return self.gen_response(
@@ -1947,6 +1955,8 @@ class UnifiCamBase(metaclass=ABCMeta):
     async def start_video_stream(
         self, stream_index: str, stream_name: str, destination: tuple[str, int]
     ):
+        if getattr(self.args, "single_channel", False) and stream_index != "video1":
+            return
         has_spawned = stream_index in self._ffmpeg_handles
         is_dead = has_spawned and self._ffmpeg_handles[stream_index].poll() is not None
 

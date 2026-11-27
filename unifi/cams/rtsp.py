@@ -59,6 +59,10 @@ class RTSPCam(UnifiCamBase):
     def add_parser(cls, parser: argparse.ArgumentParser) -> None:
         super().add_parser(parser)
         parser.add_argument(
+            "--single-channel", action="store_true",
+            help="Advertise and publish only the primary video channel",
+        )
+        parser.add_argument(
             "--source",
             "-s",
             nargs="+",
