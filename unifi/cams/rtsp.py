@@ -14,6 +14,7 @@ import aiohttp
 from aiohttp import web
 
 from unifi.cams.base import SmartDetectObjectType, UnifiCamBase, jpeg_size
+from unifi.external_motion import MotionReporter
 from unifi.reolink_isp import ReolinkIsp
 from unifi.reolink_light import ReolinkLight
 from unifi.reolink_ptz import ReolinkPtz
@@ -40,6 +41,11 @@ class RTSPCam(UnifiCamBase):
         self.runner = None
         self.sink_runner = None
         self._detector_settings = {}
+        self._external_motion = MotionReporter(self)
+        self._external_motion_session = None
+        self._external_motion_lock = asyncio.Lock()
+        self._external_motion_seen = 0.0
+        self._external_motion_watch = None
         self._sink_last_ts = 0.0
         self._sink_last_boxes_ts = 0.0
         self._ai_tracks: list = []
@@ -336,6 +342,52 @@ class RTSPCam(UnifiCamBase):
     async def _handle_detector_settings(self, request):
         return web.json_response(self._detector_settings)
 
+    async def _reconcile_external_motion(self, desired):
+        if self._external_motion_session is not self._session:
+            self._external_motion.started.clear()
+            self._external_motion_session = self._session
+        if self._session is None or getattr(self._session, "closed", False):
+            return
+        for zone in sorted(self._external_motion.started.keys() - desired):
+            await self._external_motion.edge("stop", zone)
+        for zone in sorted(desired - self._external_motion.started.keys()):
+            await self._external_motion.edge("start", zone)
+
+    async def _handle_external_motion(self, request):
+        data = await request.json()
+        zones = data.get("zones") if isinstance(data, dict) else None
+        if not isinstance(zones, list) or not all(isinstance(zone, str) for zone in zones):
+            raise web.HTTPBadRequest(text="zones must be a list of strings")
+        async with self._external_motion_lock:
+            self._external_motion_seen = time.monotonic()
+            motion = self._detector_settings.get("ChangeSmartMotionSettings", {})
+            configured = motion.get("zones") or {}
+            allowed = configured.keys() if isinstance(configured, dict) else ()
+            desired = set(zones).intersection(allowed) if motion.get("enable") is True else set()
+            await self._reconcile_external_motion(desired)
+        return web.Response(text="ok")
+
+    async def _expire_external_motion(self):
+        while True:
+            await asyncio.sleep(1)
+            async with self._external_motion_lock:
+                if time.monotonic() - self._external_motion_seen > 5:
+                    try:
+                        await self._reconcile_external_motion(set())
+                    except (ConnectionError, RuntimeError):
+                        self.logger.debug("External motion interrupted by reconnect")
+
+    def _external_detection_cutoff(self, zones):
+        smart = self._detector_settings.get("ChangeSmartDetectSettings", {})
+        configured = smart.get("zones") or {}
+        if not isinstance(configured, dict):
+            return 0.75
+        def cutoff(zone):
+            settings = configured.get(str(zone))
+            sensitivity = settings.get("sensitivity") if isinstance(settings, dict) else None
+            return (1000 - 9 * sensitivity) / 1000 if type(sensitivity) in (int, float) and 0 <= sensitivity <= 100 else 0.75
+        return min((cutoff(zone) for zone in zones or ()), default=0.75)
+
     async def run(self) -> None:
         if self.args.http_api:
             self.logger.info(f"Enabling HTTP API on port {self.args.http_api}")
@@ -375,6 +427,7 @@ class RTSPCam(UnifiCamBase):
             sink.add_routes([web.get("/state", self._handle_sidecar_state)])
             if external_detector:
                 sink.router.add_get("/settings", self._handle_detector_settings)
+                sink.router.add_post("/motion", self._handle_external_motion)
             self.sink_runner = web.AppRunner(sink)
             await self.sink_runner.setup()
             # The bundled sidecar is in this container: keep the sink off the pod network.
@@ -382,6 +435,8 @@ class RTSPCam(UnifiCamBase):
             await web.TCPSite(
                 self.sink_runner, host=host, port=self.args.ai_sink_port
             ).start()
+        if external_detector:
+            self._external_motion_watch = asyncio.create_task(self._expire_external_motion())
         if bundled_sidecar:
             self._sidecar_task = asyncio.create_task(self._supervise_sidecar())
 
@@ -663,7 +718,8 @@ class RTSPCam(UnifiCamBase):
             ):
                 continue
             confidence = float(box.get("confidence") or 0.8)
-            if confidence < self._min_confidence(kind):
+            external = getattr(self.args, "external_detector", False)
+            if not external and confidence < self._min_confidence(kind):
                 continue
             # Honor the zones drawn in Protect: a detection whose box
             # center sits outside every smart-detect zone (or inside an
@@ -672,6 +728,8 @@ class RTSPCam(UnifiCamBase):
                 kind, coord[0] + coord[2] / 2, coord[1] + coord[3] / 2
             )
             if zone_ids is not None and not zone_ids:
+                continue
+            if external and confidence < self._external_detection_cutoff(zone_ids):
                 continue
             descriptors.append(
                 self.build_smart_descriptor(
@@ -1270,6 +1328,12 @@ class RTSPCam(UnifiCamBase):
                 await asyncio.sleep(self.args.reolink_ai_interval)
 
     async def close(self) -> None:
+        if self._external_motion_watch is not None:
+            self._external_motion_watch.cancel()
+            await asyncio.gather(self._external_motion_watch, return_exceptions=True)
+            self._external_motion_watch = None
+        self._external_motion.started.clear()
+        self._detector_settings.clear()
         await super().close()
         if self.runner:
             await self.runner.cleanup()
