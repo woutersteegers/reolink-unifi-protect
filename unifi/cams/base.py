@@ -560,8 +560,13 @@ class UnifiCamBase(metaclass=ABCMeta):
         self,
         object_type: Optional[SmartDetectObjectType] = None,
         descriptors: Optional[list] = None,
+        *,
+        frame_wall_ms: Optional[int] = None,
     ) -> None:
         if not self._motion_event_ts:
+            stamp = frame_wall_ms if object_type else None
+            if stamp is None:
+                stamp = int(round(time.time() * 1000))
             payload: dict[str, Any] = {
                 # Real wall/monotonic clocks: Protect timestamps each
                 # descriptor sample off clockBestWall when persisting
@@ -569,11 +574,11 @@ class UnifiCamBase(metaclass=ABCMeta):
                 # epoch 0, the track is discarded, and the event
                 # thumbnail cropper has no box to zoom to.
                 "clockBestMonotonic": int(self.get_uptime()),
-                "clockBestWall": int(round(time.time() * 1000)),
+                "clockBestWall": stamp,
                 "clockMonotonic": int(self.get_uptime()),
                 "clockStream": int(self.get_uptime()),
                 "clockStreamRate": 1000,
-                "clockWall": int(round(time.time() * 1000)),
+                "clockWall": stamp,
                 "edgeType": "start",
                 "eventId": self._motion_event_id,
                 "eventType": "motion",
@@ -718,7 +723,9 @@ class UnifiCamBase(metaclass=ABCMeta):
             "tag": "",
         }
 
-    async def trigger_motion_update(self, descriptors: list) -> None:
+    async def trigger_motion_update(
+        self, descriptors: list, *, frame_wall_ms: Optional[int] = None
+    ) -> None:
         """Stream a `moving` track update for an ongoing smart event.
 
         Real cameras send these continuously so the detection box
@@ -726,13 +733,16 @@ class UnifiCamBase(metaclass=ABCMeta):
         """
         if not self._motion_event_ts or not descriptors:
             return
+        stamp = frame_wall_ms
+        if stamp is None:
+            stamp = int(round(time.time() * 1000))
         payload: dict[str, Any] = {
             "clockBestMonotonic": int(self.get_uptime()),
-            "clockBestWall": int(round(time.time() * 1000)),
+            "clockBestWall": stamp,
             "clockMonotonic": int(self.get_uptime()),
             "clockStream": int(self.get_uptime()),
             "clockStreamRate": 1000,
-            "clockWall": int(round(time.time() * 1000)),
+            "clockWall": stamp,
             "edgeType": "moving",
             "eventId": self._motion_event_id,
             "eventType": "motion",
