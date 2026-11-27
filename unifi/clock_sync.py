@@ -3,7 +3,6 @@ Helper program to inject absolute wall clock time into FLV stream for recordings
 """
 
 import argparse
-import struct
 import sys
 import time
 
@@ -33,23 +32,17 @@ def write_log(data):
     sys.stderr.buffer.write(f"{data}\n".encode())
 
 
-def write_timestamp_trailer(is_packet, ts):
-    # 16-byte inter-tag trailer: one zero byte, a 3-byte clock rate
-    # (90000 for video tags, 11025 for everything else), 8 padding bytes,
-    # then elapsed wall-clock in TICKS OF THAT CLOCK. The old fixed
-    # ts*100000 made Protect's ms derive audio wall-clocks running 9x
-    # fast and video 1.11x fast; once the drift crossed its 1000 ms
-    # threshold it dropped frames (InNetLiveFLVStream::FeedData FAILED),
-    # starving live view and the recorder.
-    write(make_ui8(0))
-    if is_packet:
-        clock = 90000
-        write(bytes([1, 95, 144, 0, 0, 0, 0, 0, 0, 0, 0]))
-    else:
-        clock = 11025
-        write(bytes([0, 43, 17, 0, 0, 0, 0, 0, 0, 0, 0]))
+VIDEO_RATE = 90_000
+AUDIO_AND_METADATA_RATE = 11_025
 
-    write(make_ui32(int(ts * clock) & 0xFFFFFFFF))
+
+def media_ticks(timestamp_ms, rate):
+    return timestamp_ms * rate // 1000
+
+
+def write_timestamp_trailer(rate, ticks):
+    write(b"\0" + rate.to_bytes(3, "big") + bytes(8))
+    write(make_ui32(ticks & 0xFFFFFFFF))
 
 
 def main(args):
@@ -72,52 +65,44 @@ def main(args):
     # Tag 0 previous size
     write(read_bytes(source, 4))
 
-    last_ts = time.time()
-    start = time.time()
-    i = 0
+    last_sync = None
+    origin_ms = None
     while True:
-        # Packet structure from Wikipedia:
-        #
-        # Size of previous packet	uint32_be	0	For first packet set to NULL
-        #
-        # Packet Type	uint8	18	For first packet set to AMF Metadata
-        # Payload Size	uint24_be	varies	Size of packet data only
-        # Timestamp Lower	uint24_be	0	For first packet set to NULL
-        # Timestamp Upper	uint8	0	Extension to create a uint32_be value
-        # Stream ID	uint24_be	0	For first stream of same type set to NULL
-        #
-        # Payload Data	freeform	varies	Data as defined by packet type
-
-        header = read_bytes(source, 12)
-        if len(header) != 12:
-            write(header)
+        header = read_bytes(source, 11)
+        if not header:
             return
+        if len(header) != 11:
+            raise EOFError("Incomplete FLV tag header")
 
-        # Packet type
         packet_type = header[0]
+        payload_size = int.from_bytes(header[1:4], "big")
+        payload = read_bytes(source, payload_size)
+        previous_size = read_bytes(source, 4)
+        if len(payload) != payload_size or len(previous_size) != 4:
+            raise EOFError("Incomplete FLV tag")
 
-        # Get payload size to know how many bytes to read
-        high, low = struct.unpack(">BH", header[1:4])
-        payload_size = (high << 16) + low
+        timestamp = int.from_bytes(header[7:8] + header[4:7], "big")
+        if origin_ms is None:
+            origin_ms = time.time_ns() // 1_000_000 - timestamp
 
-        # Get timestamp to inject into clock sync tag
-        low_high = header[4:8]
-        combined = bytes([low_high[3]]) + low_high[:3]
-        timestamp = struct.unpack(">i", combined)[0]
+        rate = VIDEO_RATE if packet_type == 9 else AUDIO_AND_METADATA_RATE
+        is_video_picture = (packet_type == 9 and len(payload) >= 5
+                          and (payload[0] & 15) in (7, 8) and payload[1] == 1)
+        presentation_ms = timestamp
+        if is_video_picture:
+            presentation_ms += int.from_bytes(payload[2:5], "big", signed=True)
+        ticks = media_ticks(presentation_ms, rate)
 
-        now = time.time()
-        if not last_ts or now - last_ts >= 5:
-            last_ts = now
-            # Insert a custom packet every so often for time synchronization
-            data = FLVObject()
-            data["streamClock"] = int(timestamp)
-            data["streamClockBase"] = 0
-            data["wallClock"] = now * 1000
-            packet_to_inject = create_script_tag("onClockSync", data, timestamp)
-            write(packet_to_inject)
-
-            # Write 15 byte trailer
-            write_timestamp_trailer(False, now - start)
+        should_sync = packet_type == 9 if last_sync is None else timestamp - last_sync >= 5000
+        if should_sync:
+            last_sync = timestamp
+            metadata = FLVObject()
+            metadata["streamClock"] = timestamp
+            metadata["streamClockBase"] = 0
+            metadata["wallClock"] = origin_ms + timestamp
+            write(create_script_tag("onClockSync", metadata, timestamp))
+            metadata_ticks = media_ticks(timestamp, AUDIO_AND_METADATA_RATE)
+            write_timestamp_trailer(AUDIO_AND_METADATA_RATE, metadata_ticks)
 
             # Write mpma tag
             # {'cs': {'cur': 1500000.0,
@@ -153,25 +138,13 @@ def main(args):
 
             write(packet_to_inject)
 
-            # Write 15 byte trailer
-            write_timestamp_trailer(False, now - start)
+            write_timestamp_trailer(AUDIO_AND_METADATA_RATE, metadata_ticks)
 
-            # Write rest of original packet minus previous packet size
-            write(header)
-            write(read_bytes(source, payload_size))
-        else:
-            # Write the original packet
-            write(header)
-            write(read_bytes(source, payload_size))
+        write(header)
+        write(payload)
+        write(previous_size)
+        write_timestamp_trailer(rate, ticks)
 
-        # Write previous packet size
-        write(read_bytes(source, 3))
-
-        # Write 15 byte trailer
-        write_timestamp_trailer(packet_type == 9, now - start)
-
-        # Write mpma tag
-        i += 1
 
 
 def parse_args():
